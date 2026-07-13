@@ -1,0 +1,39 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# local secrets / config
+config.json
+config.local.json
+
+# runtime (project root)
+exports/
+accounts/
+logs/
+*.log
+
+# legacy
+data/
+cookie_snapshots/
+capture/
+cpa_auths/
+sub2api_exports/
+
+# misc
+.DS_Store
+.idea/
+.vscode/
+DrissionPage/
+autoPortData/
+.protocol_metrics.json
+mail_credentials.txt
+token.json
+accounts_*.txt
+*.txt
+!requirements.txt
+!docs/**/*.md
