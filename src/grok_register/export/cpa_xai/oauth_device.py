@@ -21,7 +21,12 @@ CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 ISSUER = "https://auth.x.ai"
 DEVICE_CODE_URL = "https://auth.x.ai/oauth2/device/code"
 TOKEN_URL = "https://auth.x.ai/oauth2/token"
-SCOPE = "openid profile email offline_access grok-cli:access api:access"
+# Align with Sub2API xai.SSOBuildScope when minting for Build/cli-chat-proxy chat.
+# Plain CLI scope lacks conversations:read/write and often 403s chat endpoint.
+SCOPE = (
+    "openid profile email offline_access grok-cli:access api:access "
+    "conversations:read conversations:write"
+)
 
 LogFn = Callable[[str], None]
 

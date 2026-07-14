@@ -21,6 +21,7 @@ import re
 import string
 import json
 import traceback
+import base64
 
 from grok_register.paths import PACKAGE_DIR, PROJECT_ROOT
 
@@ -166,6 +167,8 @@ DEFAULT_CONFIG = {
     "cpa_force_standalone": True,
     # Prefer mint on register tab before recycle (avoids cold headless CF block).
     "cpa_mint_prefer_warm_browser": True,
+    # Prefer Sub2API-compatible SSO→Build mint (broader scope, auto device approve)
+    "cpa_mint_prefer_sso_build": True,
     "cpa_mint_timeout_sec": 300,
     "cpa_mint_required": False,
     "cpa_probe_after_write": True,
@@ -176,6 +179,8 @@ DEFAULT_CONFIG = {
     "sub2api_export_enabled": True,
     "sub2api_export_dir": "./exports/sub2api",
     "sub2api_combined_file": "./exports/sub2api/sub2api-accounts.json",
+    # preserve CPA free path (cli-chat-proxy); also: cli_chat_proxy | api_xai
+    "sub2api_base_url_mode": "preserve",
     "cpa_cloud_upload_enabled": False,
     "cpa_cloud_api_base": "",
     "cpa_cloud_management_key": "",
@@ -189,6 +194,11 @@ DEFAULT_CONFIG = {
     "sub2api_cloud_skip_default_group_bind": False,
     "sub2api_cloud_timeout": 60,
     "sub2api_cloud_retries": 3,
+    # Pre-upload OAuth token health (JWT exp). Revoked refresh cannot be detected offline.
+    "sub2api_upload_check_tokens": True,
+    "sub2api_upload_skip_unhealthy": True,
+    "sub2api_token_skew_sec": 120,
+    "sub2api_token_soon_sec": 3600,
 }
 
 
@@ -5123,6 +5133,241 @@ def get_sub2api_cloud_admin_headers(cfg):
     return headers, "missing_admin_key"
 
 
+def _jwt_payload_unverified(token):
+    """Decode JWT payload without signature verify (expiry / claims inspection only)."""
+    try:
+        part = str(token or "").split(".")[1]
+        pad = "=" * (-len(part) % 4)
+        raw = base64.urlsafe_b64decode((part + pad).encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _parse_time_to_unix_seconds_loose(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        n = int(value)
+        if n > 1_000_000_000_000:
+            return n // 1000
+        if n > 0:
+            return n
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        return _parse_time_to_unix_seconds_loose(float(text))
+    try:
+        text = text.replace("Z", "+00:00")
+        from datetime import datetime
+
+        return int(datetime.fromisoformat(text).timestamp())
+    except Exception:
+        return None
+
+
+def analyze_sub2api_oauth_account(account, *, now=None, skew_sec=120, soon_sec=3600):
+    """Inspect one Sub2API account's OAuth credentials for upload health.
+
+    Offline checks only:
+      - access_token present / JWT ``exp``
+      - credentials.expires_at / account.expires_at
+      - refresh_token present
+
+    Cannot detect ``invalid_grant`` / revoked refresh without calling xAI.
+
+    Returns dict with ``healthy``, ``remint_recommended``, ``risks``, ``access_exp``, etc.
+    """
+    now_ts = float(now if now is not None else time.time())
+    try:
+        skew = max(0, int(skew_sec))
+    except Exception:
+        skew = 120
+    try:
+        soon = max(0, int(soon_sec))
+    except Exception:
+        soon = 3600
+
+    acc = account if isinstance(account, dict) else {}
+    creds = acc.get("credentials") if isinstance(acc.get("credentials"), dict) else {}
+    name = str(acc.get("name") or "").strip()
+    email = ""
+    if isinstance(creds.get("email"), str):
+        email = creds.get("email").strip()
+    if not email and isinstance((acc.get("extra") or {}), dict):
+        email = str((acc.get("extra") or {}).get("email") or "").strip()
+    if not email and "@" in name:
+        email = name
+
+    access = str(creds.get("access_token") or "").strip()
+    refresh = str(creds.get("refresh_token") or "").strip()
+    payload = _jwt_payload_unverified(access) if access else {}
+    exp_candidates = [
+        payload.get("exp"),
+        creds.get("expires_at"),
+        acc.get("expires_at"),
+    ]
+    access_exp = None
+    for c in exp_candidates:
+        access_exp = _parse_time_to_unix_seconds_loose(c)
+        if access_exp is not None:
+            break
+
+    risks = []
+    if not access:
+        risks.append("missing_access_token")
+    if not refresh:
+        risks.append("missing_refresh_token")
+    if access and not payload.get("exp") and access_exp is None:
+        risks.append("access_exp_unknown")
+
+    access_expired = False
+    access_exp_soon = False
+    if access_exp is not None:
+        if access_exp <= now_ts + skew:
+            access_expired = True
+            risks.append("access_token_expired")
+        elif access_exp <= now_ts + soon:
+            access_exp_soon = True
+            risks.append("access_token_expiring_soon")
+
+    # If access is expired/missing, Sub2API must refresh; without refresh → hard fail.
+    if access_expired and not refresh:
+        risks.append("expired_without_refresh")
+    if access_expired and refresh:
+        # Will hit token endpoint immediately; revoked refresh → GROK_OAUTH_TOKEN_REFRESH_FAILED
+        risks.append("will_refresh_on_use")
+
+    remint_recommended = bool(
+        "missing_access_token" in risks
+        or "missing_refresh_token" in risks
+        or "expired_without_refresh" in risks
+        or "access_token_expired" in risks
+    )
+    # Expiring soon alone: still usable, but warn; do not force skip by default
+    healthy = not remint_recommended and "access_exp_unknown" not in risks
+
+    exp_iso = None
+    if access_exp is not None:
+        try:
+            from datetime import datetime, timezone
+
+            exp_iso = datetime.fromtimestamp(int(access_exp), tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        except Exception:
+            exp_iso = None
+
+    ttl_sec = None
+    if access_exp is not None:
+        ttl_sec = int(access_exp - now_ts)
+
+    return {
+        "name": name,
+        "email": email,
+        "healthy": healthy,
+        "remint_recommended": remint_recommended,
+        "access_expired": access_expired,
+        "access_exp_soon": access_exp_soon,
+        "has_access": bool(access),
+        "has_refresh": bool(refresh),
+        "access_exp": access_exp,
+        "access_exp_iso": exp_iso,
+        "ttl_sec": ttl_sec,
+        "base_url": str(creds.get("base_url") or ""),
+        "risks": risks,
+        "jwt_sub": str(payload.get("sub") or ""),
+        "jwt_scope": str(payload.get("scope") or ""),
+    }
+
+
+def filter_sub2api_document_by_token_health(
+    data_doc,
+    *,
+    cfg=None,
+    log_callback=None,
+    now=None,
+):
+    """Filter / annotate Sub2API data doc accounts by offline OAuth health.
+
+    Config:
+      sub2api_upload_check_tokens (default True)
+      sub2api_upload_skip_unhealthy (default True) — drop remint_recommended accounts
+      sub2api_token_skew_sec (default 120)
+      sub2api_token_soon_sec (default 3600)
+
+    Returns (new_doc, report_dict).
+    """
+    cfg = cfg or config
+    log = log_callback or (lambda m: None)
+    if not bool(cfg.get("sub2api_upload_check_tokens", True)):
+        return data_doc, {
+            "checked": False,
+            "kept": list(data_doc.get("accounts") or []) if isinstance(data_doc, dict) else [],
+            "skipped": [],
+            "reports": [],
+        }
+
+    skew = _cpa_cloud_cfg_int(cfg, "sub2api_token_skew_sec", 120, minimum=0, maximum=86400)
+    soon = _cpa_cloud_cfg_int(cfg, "sub2api_token_soon_sec", 3600, minimum=0, maximum=86400 * 7)
+    skip_unhealthy = bool(cfg.get("sub2api_upload_skip_unhealthy", True))
+
+    if not isinstance(data_doc, dict):
+        return data_doc, {"checked": True, "kept": [], "skipped": [], "reports": [], "error": "not_object"}
+
+    accounts = list(data_doc.get("accounts") or [])
+    kept = []
+    skipped = []
+    reports = []
+    for acc in accounts:
+        if not isinstance(acc, dict):
+            continue
+        rep = analyze_sub2api_oauth_account(
+            acc, now=now, skew_sec=skew, soon_sec=soon
+        )
+        reports.append(rep)
+        label = rep.get("email") or rep.get("name") or "?"
+        ttl = rep.get("ttl_sec")
+        ttl_s = f"ttl={ttl}s" if ttl is not None else "ttl=?"
+        exp_s = rep.get("access_exp_iso") or "-"
+        risk_s = ",".join(rep.get("risks") or []) or "ok"
+        if rep.get("remint_recommended"):
+            log(
+                f"[cloud-sub2api] token UNHEALTHY {label} exp={exp_s} {ttl_s} "
+                f"risks={risk_s} → remint recommended"
+                + (" (skip upload)" if skip_unhealthy else " (still uploading)")
+            )
+            if skip_unhealthy:
+                skipped.append(rep)
+                continue
+        elif rep.get("access_exp_soon"):
+            log(
+                f"[cloud-sub2api] token expiring soon {label} exp={exp_s} {ttl_s} "
+                f"risks={risk_s}"
+            )
+        else:
+            log(
+                f"[cloud-sub2api] token ok {label} exp={exp_s} {ttl_s} "
+                f"base_url={rep.get('base_url') or '-'}"
+            )
+        kept.append(acc)
+
+    new_doc = dict(data_doc)
+    new_doc["accounts"] = kept
+    return new_doc, {
+        "checked": True,
+        "kept": kept,
+        "skipped": skipped,
+        "reports": reports,
+        "kept_count": len(kept),
+        "skipped_count": len(skipped),
+        "skip_unhealthy": skip_unhealthy,
+    }
+
+
 def normalize_sub2api_data_document(doc):
     """Ensure payload is a valid sub2api-data document for v0.1.153+."""
     if not isinstance(doc, dict):
@@ -5223,6 +5468,33 @@ def upload_sub2api_data_file_to_cloud(path, cfg=None, log_callback=None, force=F
         log(f"[cloud-sub2api] invalid document: {nerr}")
         return {"ok": False, "error": nerr or "invalid", "path": fpath}
 
+    data_doc, health = filter_sub2api_document_by_token_health(
+        data_doc, cfg=cfg, log_callback=log
+    )
+    n_acc = len(data_doc.get("accounts") or [])
+    n_skipped = int(health.get("skipped_count") or 0)
+    if health.get("checked") and n_skipped:
+        log(
+            f"[cloud-sub2api] token filter: kept={health.get('kept_count', n_acc)} "
+            f"skipped_unhealthy={n_skipped} file={os.path.basename(fpath)}"
+        )
+    if n_acc == 0:
+        reason = "all_accounts_unhealthy" if n_skipped else "empty_accounts"
+        log(
+            f"[cloud-sub2api] skip upload {os.path.basename(fpath)}: {reason} "
+            f"(remint: python register_cli.py --remint-missing --headed)"
+        )
+        return {
+            "ok": False,
+            "skipped": True,
+            "error": reason,
+            "path": fpath,
+            "name": os.path.basename(fpath),
+            "account_created": 0,
+            "account_failed": 0,
+            "token_health": health,
+        }
+
     # v0.1.153: omit → skip bind defaults to true; we always send explicit bool
     skip_bind = bool(cfg.get("sub2api_cloud_skip_default_group_bind", False))
     body = {
@@ -5233,7 +5505,6 @@ def upload_sub2api_data_file_to_cloud(path, cfg=None, log_callback=None, force=F
     timeout = _cpa_cloud_cfg_int(cfg, "sub2api_cloud_timeout", 60, minimum=10, maximum=300)
     retries = _cpa_cloud_cfg_int(cfg, "sub2api_cloud_retries", 3, minimum=1, maximum=10)
     name = os.path.basename(fpath)
-    n_acc = len(data_doc.get("accounts") or [])
     # Idempotency: stable-ish per file content + name
     try:
         import hashlib
@@ -5323,6 +5594,9 @@ def upload_sub2api_data_file_to_cloud(path, cfg=None, log_callback=None, force=F
                 "account_failed": failed,
                 "errors": errors,
                 "response": payload,
+                "token_health": health,
+                "accounts_in_file": n_acc,
+                "accounts_skipped_unhealthy": n_skipped,
             }
         except Exception as exc:
             last_error = str(exc)
@@ -5331,8 +5605,20 @@ def upload_sub2api_data_file_to_cloud(path, cfg=None, log_callback=None, force=F
                 time.sleep(min(2 * attempt, 8))
                 continue
             log(f"[cloud-sub2api] exception: {exc}")
-            return {"ok": False, "path": fpath, "name": name, "error": str(exc)}
-    return {"ok": False, "path": fpath, "name": name, "error": last_error or "unknown"}
+            return {
+                "ok": False,
+                "path": fpath,
+                "name": name,
+                "error": str(exc),
+                "token_health": health,
+            }
+    return {
+        "ok": False,
+        "path": fpath,
+        "name": name,
+        "error": last_error or "unknown",
+        "token_health": health,
+    }
 
 
 def collect_sub2api_export_files(
@@ -5514,6 +5800,779 @@ def upload_sub2api_dir_to_cloud(
         "account_failed": failed_acc_total,
         "paths": paths,
         "files": results,
+    }
+
+
+# ── Sub2API online list / delete (admin accounts API) ───────────────────────
+# GET  /api/v1/admin/accounts?platform=&type=&search=&page=&page_size=
+# DELETE /api/v1/admin/accounts/:id
+# Import is create-only; to refresh credentials.base_url delete then re-import.
+
+
+def _sub2api_cloud_client(cfg):
+    """Return (api_base, headers, timeout, err_dict_or_None)."""
+    cfg = cfg or config
+    api_base = normalize_sub2api_cloud_api_base(
+        cfg.get("sub2api_cloud_api_base")
+        or os.environ.get("SUB2API_BASE_URL")
+        or os.environ.get("SUB2API_CLOUD_API_BASE")
+        or ""
+    )
+    if not api_base:
+        return "", {}, 0, {"ok": False, "error": "missing_api_base", "accounts": []}
+    headers, auth_err = get_sub2api_cloud_admin_headers(cfg)
+    if auth_err:
+        return api_base, headers, 0, {"ok": False, "error": auth_err, "accounts": []}
+    timeout = _cpa_cloud_cfg_int(cfg, "sub2api_cloud_timeout", 60, minimum=10, maximum=300)
+    return api_base, headers, timeout, None
+
+
+def _sub2api_account_email(entry):
+    """Best-effort email from list item (credentials/extra may be redacted)."""
+    if not isinstance(entry, dict):
+        return ""
+    for key in ("email",):
+        v = entry.get(key)
+        if isinstance(v, str) and "@" in v:
+            return v.strip()
+    creds = entry.get("credentials")
+    if isinstance(creds, dict):
+        v = creds.get("email")
+        if isinstance(v, str) and "@" in v:
+            return v.strip()
+    extra = entry.get("extra")
+    if isinstance(extra, dict):
+        v = extra.get("email")
+        if isinstance(v, str) and "@" in v:
+            return v.strip()
+    name = str(entry.get("name") or "").strip()
+    if "@" in name:
+        return name
+    return ""
+
+
+def _sub2api_account_match_fields(entry):
+    """Haystacks for fuzzy match: id, name, email, platform, type."""
+    if not isinstance(entry, dict):
+        return []
+    fields = []
+    for key in ("id", "name", "platform", "type", "status", "notes"):
+        v = entry.get(key)
+        if v is not None and str(v).strip():
+            fields.append(str(v).strip())
+    em = _sub2api_account_email(entry)
+    if em:
+        fields.append(em)
+    creds = entry.get("credentials")
+    if isinstance(creds, dict):
+        for key in ("email", "client_id", "base_url", "sub"):
+            v = creds.get(key)
+            if v is not None and str(v).strip():
+                fields.append(str(v).strip())
+    extra = entry.get("extra")
+    if isinstance(extra, dict):
+        for key in ("email", "email_key", "import_source", "source", "name"):
+            v = extra.get(key)
+            if v is not None and str(v).strip():
+                fields.append(str(v).strip())
+    # de-dupe preserve order
+    seen = set()
+    out = []
+    for f in fields:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def match_sub2api_accounts(accounts, patterns, *, case_sensitive=False):
+    """Filter Sub2API account list entries by fuzzy patterns (OR).
+
+    Same rules as ``match_cpa_auth_files``: substring / glob / ``re:regex``.
+    """
+    import fnmatch
+
+    if patterns is None:
+        pats = []
+    elif isinstance(patterns, (str, bytes)):
+        pats = [str(patterns)]
+    else:
+        pats = [str(p) for p in patterns if str(p).strip()]
+
+    if not pats:
+        return [a for a in (accounts or []) if isinstance(a, dict)]
+
+    matched = []
+    seen = set()
+    for entry in accounts or []:
+        if not isinstance(entry, dict):
+            continue
+        fields = _sub2api_account_match_fields(entry)
+        if not fields:
+            continue
+        aid = entry.get("id")
+        key = str(aid) if aid is not None else str(entry.get("name") or fields[0])
+        hit = False
+        for pat in pats:
+            pat = pat.strip()
+            if not pat:
+                continue
+            if pat.lower().startswith("re:"):
+                flags = 0 if case_sensitive else re.I
+                try:
+                    cre = re.compile(pat[3:], flags)
+                except re.error:
+                    continue
+                if any(cre.search(f) for f in fields):
+                    hit = True
+                    break
+            elif any(ch in pat for ch in "*?[]"):
+                check = fields + [os.path.basename(f) for f in fields]
+                if case_sensitive:
+                    if any(fnmatch.fnmatch(f, pat) for f in check):
+                        hit = True
+                        break
+                else:
+                    pat_l = pat.lower()
+                    if any(fnmatch.fnmatch(f.lower(), pat_l) for f in check):
+                        hit = True
+                        break
+            else:
+                if case_sensitive:
+                    if any(pat in f for f in fields):
+                        hit = True
+                        break
+                else:
+                    pl = pat.lower()
+                    if any(pl in f.lower() for f in fields):
+                        hit = True
+                        break
+        if hit and key not in seen:
+            seen.add(key)
+            matched.append(entry)
+    return matched
+
+
+def list_sub2api_accounts_on_cloud(
+    cfg=None,
+    log_callback=None,
+    *,
+    platform="grok",
+    account_type="",
+    status="",
+    search="",
+    page_size=100,
+    max_pages=200,
+):
+    """List online Sub2API accounts via GET /api/v1/admin/accounts (paginated).
+
+    Default ``platform=grok`` (this project's import platform). Pass ``platform=""``
+    or ``"*"`` / ``"all"`` to list every platform.
+    """
+    cfg = cfg or config
+    log = log_callback or (lambda m: None)
+    api_base, headers, timeout, err = _sub2api_cloud_client(cfg)
+    if err:
+        log(f"[cloud-sub2api] list skipped: {err.get('error')}")
+        return err
+
+    plat = str(platform or "").strip()
+    if plat.lower() in ("*", "all", "any"):
+        plat = ""
+    acc_type = str(account_type or "").strip()
+    st = str(status or "").strip()
+    q = str(search or "").strip()[:100]
+    try:
+        ps = int(page_size)
+    except Exception:
+        ps = 100
+    ps = max(1, min(ps, 1000))
+
+    accounts = []
+    total_reported = None
+    page = 1
+    while page <= max_pages:
+        params = {"page": page, "page_size": ps}
+        if plat:
+            params["platform"] = plat
+        if acc_type:
+            params["type"] = acc_type
+        if st:
+            params["status"] = st
+        if q:
+            params["search"] = q
+        url = api_base + "/api/v1/admin/accounts"
+        try:
+            res = std_requests.get(url, headers=headers, params=params, timeout=timeout)
+            preview = response_preview(res, 400)
+            if not (200 <= res.status_code < 300):
+                log(f"[cloud-sub2api] list failed: status={res.status_code} body={preview}")
+                return {
+                    "ok": False,
+                    "status_code": res.status_code,
+                    "error": preview,
+                    "accounts": accounts,
+                    "api_base": api_base,
+                }
+            try:
+                payload = res.json()
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "invalid_json",
+                    "raw": preview,
+                    "accounts": accounts,
+                    "api_base": api_base,
+                }
+            data = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(data, dict):
+                # some builds may return list in data
+                if isinstance(data, list):
+                    batch = [x for x in data if isinstance(x, dict)]
+                    accounts.extend(batch)
+                    break
+                return {
+                    "ok": False,
+                    "error": "unexpected_list_shape",
+                    "raw": preview,
+                    "accounts": accounts,
+                    "api_base": api_base,
+                }
+            code = payload.get("code") if isinstance(payload, dict) else None
+            if code not in (0, "0", None):
+                return {
+                    "ok": False,
+                    "error": payload.get("message") or preview,
+                    "accounts": accounts,
+                    "api_base": api_base,
+                    "response": payload,
+                }
+            items = data.get("items")
+            if items is None:
+                items = data.get("accounts") or data.get("list") or []
+            if not isinstance(items, list):
+                items = []
+            batch = [x for x in items if isinstance(x, dict)]
+            accounts.extend(batch)
+            try:
+                total_reported = int(data.get("total"))
+            except Exception:
+                total_reported = total_reported
+            pages = data.get("pages")
+            try:
+                pages_i = int(pages) if pages is not None else None
+            except Exception:
+                pages_i = None
+            if not batch:
+                break
+            if pages_i is not None and page >= pages_i:
+                break
+            if total_reported is not None and len(accounts) >= total_reported:
+                break
+            if len(batch) < ps:
+                break
+            page += 1
+        except Exception as exc:
+            log(f"[cloud-sub2api] list exception: {exc}")
+            return {
+                "ok": False,
+                "error": str(exc),
+                "accounts": accounts,
+                "api_base": api_base,
+            }
+
+    # normalize: ensure id is present as int when possible
+    for acc in accounts:
+        if "id" in acc and not isinstance(acc["id"], int):
+            try:
+                acc["id"] = int(acc["id"])
+            except Exception:
+                pass
+        if not acc.get("_email"):
+            acc["_email"] = _sub2api_account_email(acc)
+
+    log(
+        f"[cloud-sub2api] listed {len(accounts)} account(s) "
+        f"platform={plat or '*'} type={acc_type or '*'} search={q or '-'} @ {api_base}"
+    )
+    return {
+        "ok": True,
+        "accounts": accounts,
+        "total": total_reported if total_reported is not None else len(accounts),
+        "api_base": api_base,
+        "platform": plat,
+        "account_type": acc_type,
+        "search": q,
+    }
+
+
+def delete_sub2api_account_on_cloud(account_id, cfg=None, log_callback=None):
+    """DELETE /api/v1/admin/accounts/:id — single account by numeric id."""
+    cfg = cfg or config
+    log = log_callback or (lambda m: None)
+    try:
+        aid = int(account_id)
+    except Exception:
+        return {"ok": False, "error": "invalid_id", "id": account_id}
+    if aid <= 0:
+        return {"ok": False, "error": "invalid_id", "id": account_id}
+
+    api_base, headers, timeout, err = _sub2api_cloud_client(cfg)
+    if err:
+        log(f"[cloud-sub2api] delete skipped: {err.get('error')}")
+        return {**err, "id": aid}
+
+    url = f"{api_base}/api/v1/admin/accounts/{aid}"
+    try:
+        res = std_requests.delete(url, headers=headers, timeout=timeout)
+        preview = response_preview(res, 400)
+        if not (200 <= res.status_code < 300):
+            log(f"[cloud-sub2api] delete id={aid} failed: status={res.status_code} body={preview}")
+            return {
+                "ok": False,
+                "id": aid,
+                "status_code": res.status_code,
+                "error": preview,
+            }
+        try:
+            payload = res.json()
+        except Exception:
+            payload = {"raw": preview}
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if code not in (0, "0", None):
+            msg = (payload.get("message") if isinstance(payload, dict) else None) or preview
+            log(f"[cloud-sub2api] delete id={aid} rejected code={code} msg={msg}")
+            return {
+                "ok": False,
+                "id": aid,
+                "status_code": res.status_code,
+                "error": msg,
+                "response": payload,
+            }
+        log(f"[cloud-sub2api] deleted id={aid}")
+        return {
+            "ok": True,
+            "id": aid,
+            "status_code": res.status_code,
+            "response": payload,
+        }
+    except Exception as exc:
+        log(f"[cloud-sub2api] delete id={aid} exception: {exc}")
+        return {"ok": False, "id": aid, "error": str(exc)}
+
+
+def delete_sub2api_accounts_on_cloud(
+    patterns=None,
+    cfg=None,
+    log_callback=None,
+    *,
+    dry_run=True,
+    delete_all=False,
+    platform="grok",
+    account_type="",
+    status="",
+    search="",
+    case_sensitive=False,
+    _prelisted_accounts=None,
+):
+    """List online accounts, fuzzy-match (or all), optionally DELETE by id.
+
+    Sub2API has **no** bulk delete endpoint — only ``DELETE /accounts/:id``.
+    Import is create-only, so replace workflow = delete matched + re-upload.
+
+    Args:
+      patterns: substring / glob / ``re:regex`` (OR). Ignored when delete_all.
+      delete_all: match every listed account under platform filter.
+      platform: default ``grok``; ``*``/``all`` for all platforms.
+      dry_run: if True, only list matches (default True).
+    """
+    cfg = cfg or config
+    log = log_callback or (lambda m: None)
+
+    if _prelisted_accounts is not None:
+        accounts = [a for a in _prelisted_accounts if isinstance(a, dict)]
+        listed_ok = True
+        total_online = len(accounts)
+        api_base = None
+    else:
+        listed = list_sub2api_accounts_on_cloud(
+            cfg=cfg,
+            log_callback=log,
+            platform=platform,
+            account_type=account_type,
+            status=status,
+            search=search,
+        )
+        if not listed.get("ok"):
+            return {
+                "ok": False,
+                "error": listed.get("error") or "list_failed",
+                "status_code": listed.get("status_code"),
+                "matched": [],
+                "deleted": [],
+                "failed": [],
+                "dry_run": dry_run,
+            }
+        accounts = listed.get("accounts") or []
+        total_online = int(listed.get("total") or len(accounts))
+        api_base = listed.get("api_base")
+        listed_ok = True
+
+    if delete_all:
+        matched = [a for a in accounts if isinstance(a, dict)]
+    else:
+        if not patterns:
+            log("[cloud-sub2api] no patterns and delete_all=false; nothing to match")
+            return {
+                "ok": True,
+                "dry_run": dry_run,
+                "delete_all": False,
+                "total_online": total_online,
+                "matched": [],
+                "match_count": 0,
+                "deleted": [],
+                "failed": [],
+                "ok_count": 0,
+                "fail_count": 0,
+            }
+        matched = match_sub2api_accounts(
+            accounts, patterns, case_sensitive=case_sensitive
+        )
+
+    # dedupe by id
+    seen = set()
+    uniq = []
+    for e in matched:
+        aid = e.get("id")
+        key = str(aid) if aid is not None else str(e.get("name") or id(e))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(e)
+    matched = uniq
+
+    log(
+        f"[cloud-sub2api] fuzzy match: {len(matched)}/{len(accounts)} account(s) "
+        f"patterns={patterns!r} delete_all={delete_all} platform={platform!r} dry_run={dry_run}"
+    )
+    for e in matched:
+        log(
+            f"  - id={e.get('id')} name={e.get('name') or '-'} "
+            f"email={_sub2api_account_email(e) or e.get('_email') or '-'} "
+            f"platform={e.get('platform') or '-'} type={e.get('type') or '-'}"
+        )
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "delete_all": bool(delete_all),
+            "total_online": total_online,
+            "matched": matched,
+            "match_count": len(matched),
+            "deleted": [],
+            "failed": [],
+            "api_base": api_base,
+            "platform": platform,
+        }
+
+    if not matched:
+        log("[cloud-sub2api] nothing matched; no delete performed")
+        return {
+            "ok": True,
+            "dry_run": False,
+            "delete_all": bool(delete_all),
+            "total_online": total_online,
+            "matched": [],
+            "match_count": 0,
+            "deleted": [],
+            "failed": [],
+            "ok_count": 0,
+            "fail_count": 0,
+            "api_base": api_base,
+        }
+
+    deleted = []
+    failed = []
+    for e in matched:
+        aid = e.get("id")
+        if aid is None:
+            failed.append({"id": None, "name": e.get("name"), "error": "no_id", "entry": e})
+            continue
+        res = delete_sub2api_account_on_cloud(aid, cfg=cfg, log_callback=log)
+        res["name"] = e.get("name")
+        res["email"] = _sub2api_account_email(e) or e.get("_email")
+        if res.get("ok"):
+            deleted.append(res)
+        else:
+            failed.append(res)
+
+    return {
+        "ok": len(failed) == 0,
+        "dry_run": False,
+        "delete_all": bool(delete_all),
+        "total_online": total_online,
+        "matched": matched,
+        "match_count": len(matched),
+        "deleted": deleted,
+        "failed": failed,
+        "ok_count": len(deleted),
+        "fail_count": len(failed),
+        "api_base": api_base,
+        "platform": platform,
+    }
+
+
+def delete_all_sub2api_accounts_on_cloud(
+    cfg=None,
+    log_callback=None,
+    *,
+    dry_run=True,
+    platform="grok",
+    account_type="",
+):
+    """Delete every online account matching platform filter (default grok).
+
+    There is no server-side ``?all=true`` for accounts — loops ``DELETE /:id``.
+    """
+    return delete_sub2api_accounts_on_cloud(
+        patterns=None,
+        cfg=cfg,
+        log_callback=log_callback,
+        dry_run=dry_run,
+        delete_all=True,
+        platform=platform,
+        account_type=account_type,
+    )
+
+
+def collect_emails_from_sub2api_export_files(paths):
+    """Read local Sub2API JSON paths and return unique email/name tokens for match."""
+    tokens = []
+    seen = set()
+    for path in paths or []:
+        try:
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                doc = json.load(fh)
+        except Exception:
+            continue
+        accounts = []
+        if isinstance(doc, dict):
+            if isinstance(doc.get("accounts"), list):
+                accounts = doc["accounts"]
+            elif doc.get("platform") and doc.get("credentials"):
+                accounts = [doc]
+        for acc in accounts:
+            if not isinstance(acc, dict):
+                continue
+            for tok in (
+                _sub2api_account_email(acc),
+                str(acc.get("name") or "").strip(),
+            ):
+                t = (tok or "").strip()
+                if not t or t in seen:
+                    continue
+                seen.add(t)
+                tokens.append(t)
+    return tokens
+
+
+def delete_sub2api_latest_batch_on_cloud(
+    *,
+    sub2api_dir=None,
+    files=None,
+    recursive=False,
+    cfg=None,
+    log_callback=None,
+    dry_run=True,
+    platform="grok",
+):
+    """Delete online accounts matching emails/names in a local Sub2API export set.
+
+    Typical use: pass the latest batch root (or its ``sub2api/`` dir) so online
+    accounts from that batch can be removed without re-uploading.
+    """
+    cfg = cfg or config
+    log = log_callback or (lambda m: None)
+    paths = collect_sub2api_export_files(
+        sub2api_dir=sub2api_dir,
+        files=files,
+        recursive=recursive,
+        cfg=cfg,
+        prefer_combined=True,
+    )
+    if not paths:
+        log("[cloud-sub2api] delete-latest: no local Sub2API JSON found")
+        return {
+            "ok": False,
+            "error": "no_local_files",
+            "dry_run": dry_run,
+            "paths": [],
+            "local_tokens": [],
+            "matched": [],
+            "match_count": 0,
+        }
+
+    tokens = collect_emails_from_sub2api_export_files(paths)
+    log(
+        f"[cloud-sub2api] delete-latest: local_files={len(paths)} "
+        f"local_tokens={len(tokens)} platform={platform!r} dry_run={dry_run}"
+    )
+    for p in paths:
+        log(f"  local: {p}")
+    if not tokens:
+        log("[cloud-sub2api] delete-latest: no email/name tokens in local files")
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "paths": paths,
+            "local_tokens": [],
+            "matched": [],
+            "match_count": 0,
+            "deleted": [],
+            "failed": [],
+            "ok_count": 0,
+            "fail_count": 0,
+        }
+
+    summary = delete_sub2api_accounts_on_cloud(
+        patterns=tokens,
+        cfg=cfg,
+        log_callback=log,
+        dry_run=dry_run,
+        delete_all=False,
+        platform=platform,
+    )
+    summary = dict(summary)
+    summary["paths"] = paths
+    summary["local_tokens"] = tokens
+    summary["batch_dir"] = sub2api_dir
+    return summary
+
+
+def replace_sub2api_upload_on_cloud(
+    *,
+    sub2api_dir=None,
+    files=None,
+    recursive=False,
+    cfg=None,
+    log_callback=None,
+    dry_run=True,
+    platform="grok",
+    delete_scope="matched",
+):
+    """Delete online accounts then re-upload local Sub2API JSON (create-only import).
+
+    delete_scope:
+      - ``matched`` (default): delete online accounts whose name/email appear in
+        the local upload set
+      - ``all``: delete every online account for ``platform`` then upload
+
+    dry_run=True: only list what would be deleted / uploaded (no DELETE, no POST).
+    """
+    cfg = cfg or config
+    log = log_callback or (lambda m: None)
+    paths = collect_sub2api_export_files(
+        sub2api_dir=sub2api_dir,
+        files=files,
+        recursive=recursive,
+        cfg=cfg,
+        prefer_combined=True,
+    )
+    if not paths:
+        log("[cloud-sub2api] replace: no local Sub2API JSON to upload")
+        return {
+            "ok": False,
+            "error": "no_local_files",
+            "dry_run": dry_run,
+            "paths": [],
+        }
+
+    tokens = collect_emails_from_sub2api_export_files(paths)
+    log(
+        f"[cloud-sub2api] replace: local_files={len(paths)} "
+        f"local_tokens={len(tokens)} scope={delete_scope} dry_run={dry_run}"
+    )
+    for p in paths:
+        log(f"  upload-candidate: {p}")
+
+    if delete_scope == "all":
+        del_summary = delete_sub2api_accounts_on_cloud(
+            patterns=None,
+            cfg=cfg,
+            log_callback=log,
+            dry_run=dry_run,
+            delete_all=True,
+            platform=platform,
+        )
+    else:
+        if not tokens:
+            log("[cloud-sub2api] replace: no emails/names in local files; skip delete")
+            del_summary = {
+                "ok": True,
+                "dry_run": dry_run,
+                "matched": [],
+                "match_count": 0,
+                "deleted": [],
+                "failed": [],
+                "ok_count": 0,
+                "fail_count": 0,
+            }
+        else:
+            del_summary = delete_sub2api_accounts_on_cloud(
+                patterns=tokens,
+                cfg=cfg,
+                log_callback=log,
+                dry_run=dry_run,
+                delete_all=False,
+                platform=platform,
+            )
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "paths": paths,
+            "local_tokens": tokens,
+            "delete": del_summary,
+            "upload": None,
+            "match_count": int(del_summary.get("match_count") or 0),
+        }
+
+    if not del_summary.get("ok") and del_summary.get("error"):
+        return {
+            "ok": False,
+            "dry_run": False,
+            "paths": paths,
+            "local_tokens": tokens,
+            "delete": del_summary,
+            "upload": None,
+            "error": del_summary.get("error"),
+        }
+
+    # Proceed to upload even if some deletes failed (log and continue).
+    # Always pass explicit paths so we upload the same set we matched against.
+    upload = upload_sub2api_dir_to_cloud(
+        sub2api_dir=None,
+        cfg=cfg,
+        log_callback=log,
+        force=True,
+        files=paths,
+        recursive=False,
+    )
+
+    ok = bool(upload.get("ok")) and int(del_summary.get("fail_count") or 0) == 0
+    return {
+        "ok": ok,
+        "dry_run": False,
+        "paths": paths,
+        "local_tokens": tokens,
+        "delete": del_summary,
+        "upload": upload,
+        "account_created": upload.get("account_created"),
+        "account_failed": upload.get("account_failed"),
+        "deleted_count": del_summary.get("ok_count"),
+        "delete_fail_count": del_summary.get("fail_count"),
     }
 
 

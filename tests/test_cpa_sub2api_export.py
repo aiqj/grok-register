@@ -91,6 +91,12 @@ class DualExportTests(unittest.TestCase):
             self.assertEqual(doc.get("type"), "sub2api-data")
             self.assertEqual(doc["accounts"][0]["platform"], "grok")
             self.assertEqual(doc["accounts"][0]["type"], "oauth")
+            # Preserve free Build path (matches working Sub2API reference)
+            self.assertEqual(
+                doc["accounts"][0]["credentials"]["base_url"],
+                "https://cli-chat-proxy.grok.com/v1",
+            )
+            self.assertEqual(out.get("base_url_mode"), "preserve")
             # CPA file still present (both formats)
             self.assertTrue(cpa_path.is_file())
 

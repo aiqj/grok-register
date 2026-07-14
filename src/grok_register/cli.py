@@ -1152,6 +1152,49 @@ def main() -> int:
         help="只上传最新一批的 Sub2API 导出；可单独使用，隐含 --upload-sub2api-cloud",
     )
     parser.add_argument(
+        "--sub2api-list",
+        action="store_true",
+        help="列出线上 Sub2API 账号（Admin GET /accounts；默认 platform=grok）",
+    )
+    parser.add_argument(
+        "--sub2api-delete",
+        nargs="+",
+        default=None,
+        metavar="PATTERN",
+        help="模糊删除线上 Sub2API 账号：子串 / glob / re:正则；匹配 name/email/id；先 dry-run，加 --yes 才删除",
+    )
+    parser.add_argument(
+        "--sub2api-delete-all",
+        action="store_true",
+        help="删除线上全部匹配 platform 的账号（默认 grok；无服务端 bulk，逐条 DELETE /accounts/:id）；须 --yes",
+    )
+    parser.add_argument(
+        "--sub2api-platform",
+        default="grok",
+        metavar="PLATFORM",
+        help="Sub2API 列表/删除的 platform 过滤（默认 grok；* 表示全部）",
+    )
+    parser.add_argument(
+        "--sub2api-delete-latest",
+        action="store_true",
+        help="按本地最新批 email/name 删除线上匹配账号（只删不传；须 --yes）",
+    )
+    parser.add_argument(
+        "--sub2api-replace-latest",
+        action="store_true",
+        help="先按本地最新批 email/name 删除线上匹配账号，再上传最新批（导入仅 create；须 --yes）",
+    )
+    parser.add_argument(
+        "--sub2api-replace-all-platform",
+        action="store_true",
+        help="与 --sub2api-replace-latest 联用：删除该 platform 下全部线上账号后再上传（危险）",
+    )
+    parser.add_argument(
+        "--sub2api-upload-allow-unhealthy",
+        action="store_true",
+        help="上传 Sub2API 时不跳过 access 已过期/缺 refresh 的账号（默认跳过并提示 remint）",
+    )
+    parser.add_argument(
         "--cpa-list",
         action="store_true",
         help="列出线上 CPA 已导入的 auth 凭证（Management API）",
@@ -1224,6 +1267,254 @@ def main() -> int:
         print_startup_report(reg.config, extension_path=ext)
     except Exception as exc:
         print(f"[!] proxy/headless init: {exc}", flush=True)
+
+    # List / fuzzy-delete / delete-all / replace online Sub2API accounts
+    if (
+        args.sub2api_list
+        or args.sub2api_delete
+        or args.sub2api_delete_all
+        or args.sub2api_delete_latest
+        or args.sub2api_replace_latest
+    ):
+        cfg = getattr(reg, "config", {}) or {}
+        if getattr(args, "sub2api_upload_allow_unhealthy", False):
+            cfg = dict(cfg)
+            cfg["sub2api_upload_skip_unhealthy"] = False
+            reg.config["sub2api_upload_skip_unhealthy"] = False
+        log_fn = lambda m: print(m, flush=True)
+        platform = str(getattr(args, "sub2api_platform", None) or "grok").strip() or "grok"
+
+        def _resolve_latest_sub2api_batch():
+            latest = None
+            try:
+                from grok_register.export.cpa_export import find_latest_export_batch
+
+                latest = find_latest_export_batch(cfg, require_cpa_files=False)
+            except Exception as exc:
+                print(f"[!] 查找最新批次失败: {exc}", flush=True)
+                return None, 1
+            if latest is None:
+                parent = Path(
+                    cfg.get("export_batch_parent")
+                    or cfg.get("export_root")
+                    or "./exports"
+                )
+                if not parent.is_absolute():
+                    parent = (PROJECT_ROOT / parent).resolve()
+                if parent.is_dir():
+                    cands = sorted(
+                        [
+                            p
+                            for p in parent.iterdir()
+                            if p.is_dir() and (p / "sub2api").is_dir()
+                        ],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    latest = cands[0] if cands else None
+            if latest is None:
+                print("[!] 未找到含 sub2api/ 的最新批次目录", flush=True)
+                return None, 1
+            return latest, 0
+
+        if args.sub2api_delete_latest:
+            latest_batch, err_code = _resolve_latest_sub2api_batch()
+            if err_code:
+                return err_code
+            dry_run = (not args.yes) or bool(getattr(args, "cpa_delete_dry_run", False))
+            print(
+                f"[*] Sub2API 删除最新批: batch={latest_batch.name} "
+                f"platform={platform} {'dry-run' if dry_run else 'EXECUTE'}",
+                flush=True,
+            )
+            if dry_run:
+                print(
+                    "[*] 预览：按本地最新批 email/name 删除线上匹配账号。"
+                    "确认删除请追加: --yes",
+                    flush=True,
+                )
+            summary = reg.delete_sub2api_latest_batch_on_cloud(
+                sub2api_dir=str(latest_batch),
+                cfg=cfg,
+                log_callback=log_fn,
+                dry_run=dry_run,
+                platform=platform,
+            )
+            if not summary.get("ok") and summary.get("error"):
+                print(f"[!] 删除最新批失败: {summary.get('error')}", flush=True)
+                return 1
+            n = int(summary.get("match_count") or 0)
+            if dry_run:
+                print(
+                    f"=== dry-run 删除最新批: match={n} "
+                    f"local_files={len(summary.get('paths') or [])} "
+                    f"tokens={len(summary.get('local_tokens') or [])} "
+                    f"batch={latest_batch.name} ===",
+                    flush=True,
+                )
+                print(
+                    "[*] 确认删除: python register_cli.py --sub2api-delete-latest --yes",
+                    flush=True,
+                )
+                return 0
+            ok_n = int(summary.get("ok_count") or 0)
+            fail_n = int(summary.get("fail_count") or 0)
+            print(
+                f"=== 删除最新批完成: ok={ok_n} fail={fail_n} matched={n} "
+                f"batch={latest_batch.name} ===",
+                flush=True,
+            )
+            if ok_n == 0 and fail_n > 0:
+                return 1
+            if fail_n > 0:
+                return 2
+            return 0
+
+        if args.sub2api_replace_latest:
+            latest_batch, err_code = _resolve_latest_sub2api_batch()
+            if err_code:
+                return err_code
+            dry_run = (not args.yes) or bool(getattr(args, "cpa_delete_dry_run", False))
+            delete_scope = (
+                "all" if args.sub2api_replace_all_platform else "matched"
+            )
+            print(
+                f"[*] Sub2API replace latest: batch={latest_batch.name} "
+                f"platform={platform} scope={delete_scope} "
+                f"{'dry-run' if dry_run else 'EXECUTE'}",
+                flush=True,
+            )
+            if dry_run:
+                print(
+                    "[*] 预览：将删除匹配账号并上传。确认执行请追加: --yes",
+                    flush=True,
+                )
+            summary = reg.replace_sub2api_upload_on_cloud(
+                sub2api_dir=str(latest_batch),
+                cfg=cfg,
+                log_callback=log_fn,
+                dry_run=dry_run,
+                platform=platform,
+                delete_scope=delete_scope,
+            )
+            if not summary.get("ok") and summary.get("error"):
+                print(f"[!] replace 失败: {summary.get('error')}", flush=True)
+                return 1
+            if dry_run:
+                print(
+                    f"=== dry-run replace: delete_match={summary.get('match_count', 0)} "
+                    f"local_files={len(summary.get('paths') or [])} "
+                    f"tokens={len(summary.get('local_tokens') or [])} ===",
+                    flush=True,
+                )
+                print(
+                    "[*] 确认执行: python register_cli.py --sub2api-replace-latest --yes",
+                    flush=True,
+                )
+                return 0
+            up = summary.get("upload") or {}
+            print(
+                f"=== Sub2API replace 完成: deleted={summary.get('deleted_count', 0)} "
+                f"delete_fail={summary.get('delete_fail_count', 0)} "
+                f"created={up.get('account_created', 0)} "
+                f"upload_fail_acc={up.get('account_failed', 0)} ===",
+                flush=True,
+            )
+            if not summary.get("ok"):
+                return 2
+            return 0
+
+        if args.sub2api_list and not args.sub2api_delete and not args.sub2api_delete_all:
+            listed = reg.list_sub2api_accounts_on_cloud(
+                cfg=cfg, log_callback=log_fn, platform=platform
+            )
+            if not listed.get("ok"):
+                print(f"[!] 列出失败: {listed.get('error')}", flush=True)
+                return 1
+            accounts = listed.get("accounts") or []
+            print(
+                f"=== 线上 Sub2API 账号: {len(accounts)} 个 "
+                f"(platform={platform}, total={listed.get('total', len(accounts))}) ===",
+                flush=True,
+            )
+            for e in accounts:
+                email = (
+                    e.get("_email")
+                    or (e.get("credentials") or {}).get("email")
+                    or (e.get("extra") or {}).get("email")
+                    or "-"
+                )
+                print(
+                    f"  id={e.get('id')}  name={e.get('name') or '-'}  "
+                    f"email={email}  "
+                    f"platform={e.get('platform') or '-'}  type={e.get('type') or '-'}  "
+                    f"status={e.get('status') or '-'}",
+                    flush=True,
+                )
+            return 0
+
+        if args.sub2api_delete_all and args.sub2api_delete:
+            print(
+                "[!] 同时指定了 --sub2api-delete-all 与 --sub2api-delete：以全删为准",
+                flush=True,
+            )
+
+        dry_run = (not args.yes) or bool(getattr(args, "cpa_delete_dry_run", False))
+        if dry_run and not args.yes:
+            print(
+                "[*] 删除预览（dry-run）。确认删除请追加: --yes",
+                flush=True,
+            )
+        if args.sub2api_delete_all and not dry_run:
+            print(
+                f"[!] 即将删除线上 Sub2API platform={platform} 下全部账号（逐条 DELETE）…",
+                flush=True,
+            )
+
+        if args.sub2api_delete_all:
+            summary = reg.delete_all_sub2api_accounts_on_cloud(
+                cfg=cfg,
+                log_callback=log_fn,
+                dry_run=dry_run,
+                platform=platform,
+            )
+        else:
+            summary = reg.delete_sub2api_accounts_on_cloud(
+                patterns=args.sub2api_delete,
+                cfg=cfg,
+                log_callback=log_fn,
+                dry_run=dry_run,
+                platform=platform,
+            )
+        if not summary.get("ok") and summary.get("error"):
+            print(f"[!] 删除/匹配失败: {summary.get('error')}", flush=True)
+            return 1
+        n = int(summary.get("match_count") or len(summary.get("matched") or []))
+        if dry_run:
+            mode = "全删" if args.sub2api_delete_all else f"patterns={args.sub2api_delete}"
+            print(
+                f"=== dry-run: 匹配 {n} 个（线上共 {summary.get('total_online', '?')}）"
+                f" {mode} platform={platform} ===",
+                flush=True,
+            )
+            if args.sub2api_delete_all:
+                print(
+                    "[*] 确认删除: python register_cli.py --sub2api-delete-all --yes",
+                    flush=True,
+                )
+            return 0
+        ok_n = int(summary.get("ok_count") or 0)
+        fail_n = int(summary.get("fail_count") or 0)
+        label = "全删" if args.sub2api_delete_all else "模糊删除"
+        print(
+            f"=== 线上 Sub2API {label}完成: ok={ok_n} fail={fail_n} matched={n} ===",
+            flush=True,
+        )
+        if ok_n == 0 and fail_n > 0:
+            return 1
+        if fail_n > 0:
+            return 2
+        return 0
 
     # List / fuzzy-delete / delete-all online CPA auth files (Management API)
     if args.cpa_list or args.cpa_delete or args.cpa_delete_all:
@@ -1403,6 +1694,10 @@ def main() -> int:
     # Batch-push local Sub2API JSON into online Sub2API (admin accounts/data)
     if args.upload_sub2api_cloud or args.sub2api_upload_latest:
         cfg = getattr(reg, "config", {}) or {}
+        if getattr(args, "sub2api_upload_allow_unhealthy", False):
+            cfg = dict(cfg)
+            cfg["sub2api_upload_skip_unhealthy"] = False
+            reg.config["sub2api_upload_skip_unhealthy"] = False
         upload_dir = (args.sub2api_upload_dir or "").strip() or None
         upload_files = args.sub2api_upload_files
         recursive = bool(args.sub2api_upload_all)

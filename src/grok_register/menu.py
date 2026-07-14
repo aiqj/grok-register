@@ -11,7 +11,7 @@ import os
 import sys
 from typing import Callable
 
-MENU_VERSION = "1.2.0"
+MENU_VERSION = "1.3.1"
 
 
 def _p(msg: str = "") -> None:
@@ -149,7 +149,8 @@ def _home_screen() -> None:
     _p("    2. 补缺 CPA / Sub2API")
     _p("    3. 上传到线上")
     _p("    4. 管理线上 CPA 凭证")
-    _p("    5. 说明")
+    _p("    5. 管理线上 Sub2API 账号")
+    _p("    6. 说明")
     _p("    0. 退出")
     _p()
     _rule()
@@ -335,6 +336,72 @@ def _menu_cpa_manage() -> int:
     return 0
 
 
+def _menu_sub2api_manage() -> int:
+    _title("管理线上 Sub2API 账号")
+    _p("    1   列出账号（platform=grok）")
+    _p("    2   模糊删除（先预览）")
+    _p("    3   删除最新批（先预览）")
+    _p("    4   删除全部 grok（先预览）")
+    _p("    5   替换最新批（先删匹配再上传）")
+    _p("    0   返回")
+    _p()
+    c = _ask("操作", "1")
+    if c == "0":
+        return 0
+    if c == "1":
+        _p()
+        return _run_cli(["--sub2api-list"])
+    if c == "2":
+        _p()
+        _p("  支持：子串、glob、re:正则；匹配 name / email / id")
+        patterns = _ask("匹配", "")
+        if not patterns:
+            return 0
+        parts = patterns.split()
+        _p()
+        _p("  — 预览 —")
+        code = _run_cli(["--sub2api-delete", *parts])
+        if not _ask_yes("确认删除", False):
+            return code
+        _p()
+        return _run_cli(["--sub2api-delete", *parts, "--yes"])
+    if c == "3":
+        _p()
+        _p("  按本地最新批 exports/<批次>/sub2api 的 email/name")
+        _p("  删除线上匹配账号（只删不传）")
+        _p()
+        _p("  — 预览 —")
+        code = _run_cli(["--sub2api-delete-latest"])
+        if not _ask_yes("确认删除线上匹配的最新批账号", False):
+            return code
+        _p()
+        return _run_cli(["--sub2api-delete-latest", "--yes"])
+    if c == "4":
+        _p()
+        _p("  — 预览 —")
+        code = _run_cli(["--sub2api-delete-all"])
+        if not _ask_yes("确认删除线上全部 platform=grok 账号", False):
+            return code
+        if _ask("再输入 DELETE 确认", "") != "DELETE":
+            _p("  → 已取消")
+            return 0
+        _p()
+        return _run_cli(["--sub2api-delete-all", "--yes"])
+    if c == "5":
+        _p()
+        _p("  按本地最新批 email/name 删除线上匹配账号，再上传最新批")
+        _p("  （Sub2API 导入只能新建，不能覆盖 credentials）")
+        _p()
+        _p("  — 预览 —")
+        code = _run_cli(["--sub2api-replace-latest"])
+        if not _ask_yes("确认删除匹配并重新上传", False):
+            return code
+        _p()
+        return _run_cli(["--sub2api-replace-latest", "--yes"])
+    _p("  → 无效选项")
+    return 0
+
+
 def _menu_help() -> int:
     _title("说明")
     _p(
@@ -354,9 +421,17 @@ def _menu_help() -> int:
     register_cli.py --count 5 --headed
     register_cli.py --cpa-upload-latest
     register_cli.py --sub2api-upload-latest
+    register_cli.py --sub2api-list
+    register_cli.py --sub2api-delete @example.com --yes
+    register_cli.py --sub2api-delete-latest --yes
+    register_cli.py --sub2api-replace-latest --yes
+
+  注意
+    Sub2API 导入不覆盖已有账号；要更新 base_url 须先删后导。
 
   文档
     docs/export-cpa-and-sub2api.md
+    docs/grok-403-investigation.md   # 对话 403 排查记录
 """
     )
     return 0
@@ -368,7 +443,8 @@ _ITEMS: list[tuple[str, str, Callable[[], int]]] = [
     ("2", "补缺 CPA / Sub2API", _menu_remint),
     ("3", "上传到线上", _menu_upload),
     ("4", "管理线上 CPA 凭证", _menu_cpa_manage),
-    ("5", "说明", _menu_help),
+    ("5", "管理线上 Sub2API 账号", _menu_sub2api_manage),
+    ("6", "说明", _menu_help),
     ("0", "退出", lambda: 0),
 ]
 

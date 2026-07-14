@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any
 
 from .proxyutil import build_opener
-from .schema import DEFAULT_BASE_URL, DEFAULT_CLIENT_HEADERS
+from .schema import DEFAULT_BASE_URL, DEFAULT_CLIENT_HEADERS, SUB2API_UPSTREAM_HEADERS
 
 
 def _opener(proxy: str | None = None) -> urllib.request.OpenerDirector:
@@ -65,7 +65,14 @@ def probe_mini_response(
     base_url: str = DEFAULT_BASE_URL,
     timeout: float = 60.0,
     proxy: str | None = None,
+    style: str = "cpa",
 ) -> dict[str, Any]:
+    """Probe /responses.
+
+    style:
+      - ``cpa``: full CLI shell headers (DEFAULT_CLIENT_HEADERS)
+      - ``sub2api``: only User-Agent + X-Grok-Client-Version (Sub2API gateway)
+    """
     base = base_url.rstrip("/")
     url = f"{base}/responses"
     payload = {
@@ -74,11 +81,14 @@ def probe_mini_response(
         "input": "Reply with exactly MINT_OK",
         "reasoning": {"effort": "low"},
     }
+    client_headers = (
+        SUB2API_UPSTREAM_HEADERS if style == "sub2api" else DEFAULT_CLIENT_HEADERS
+    )
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        **DEFAULT_CLIENT_HEADERS,
+        **client_headers,
     }
     opener = _opener(proxy)
     req = urllib.request.Request(

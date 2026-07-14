@@ -402,13 +402,13 @@ def export_cpa_xai_for_account(
 
     # cookies: explicit arg > page export > none
     use_cookies = cookies
+    sso_val = (sso or "").strip()
     if use_cookies is None and cookie_inject and page is not None:
         use_cookies = export_cookies_from_page(page)
     if not cookie_inject:
         use_cookies = None
     else:
         # Always attach SSO cookie clones — register cookies alone often miss accounts.x.ai host
-        sso_val = (sso or "").strip()
         if not sso_val and isinstance(use_cookies, list):
             for c in use_cookies:
                 if isinstance(c, dict) and c.get("name") in ("sso", "sso-rw") and c.get("value"):
@@ -457,6 +457,8 @@ def export_cpa_xai_for_account(
         cookies=use_cookies,
         reuse_browser=reuse_browser,
         recycle_every=recycle_every,
+        sso=sso_val,
+        prefer_sso_build=bool(cfg.get("cpa_mint_prefer_sso_build", True)),
         log=_log,
     )
 

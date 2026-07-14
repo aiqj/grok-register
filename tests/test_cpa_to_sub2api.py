@@ -60,14 +60,47 @@ class Sub2APIExportTests(unittest.TestCase):
         self.assertLess(acc["expires_at"], 1_000_000_000_000)
         self.assertEqual(acc["credentials"]["expires_at"], "2030-01-01T00:00:00Z")
 
-    def test_base_url_rewritten_from_cli_proxy(self):
+    def test_base_url_preserved_from_cli_proxy_by_default(self):
         cpa = {
             "access_token": _fake_jwt({"exp": 1893456000}),
             "refresh_token": "rt",
             "base_url": "https://cli-chat-proxy.grok.com/v1",
         }
         acc = conv.cpa_xai_to_sub2api_account(cpa)
+        # Align with working Sub2API reference: keep free Build path
+        self.assertEqual(
+            acc["credentials"]["base_url"], "https://cli-chat-proxy.grok.com/v1"
+        )
+
+    def test_base_url_mode_api_xai_rewrites_cli_proxy(self):
+        cpa = {
+            "access_token": _fake_jwt({"exp": 1893456000}),
+            "refresh_token": "rt",
+            "base_url": "https://cli-chat-proxy.grok.com/v1",
+        }
+        acc = conv.cpa_xai_to_sub2api_account(cpa, base_url_mode="api_xai")
         self.assertEqual(acc["credentials"]["base_url"], "https://api.x.ai/v1")
+
+    def test_base_url_mode_cli_chat_proxy_forces_free_path(self):
+        cpa = {
+            "access_token": _fake_jwt({"exp": 1893456000}),
+            "refresh_token": "rt",
+            "base_url": "https://api.x.ai/v1",
+        }
+        acc = conv.cpa_xai_to_sub2api_account(cpa, base_url_mode="cli_chat_proxy")
+        self.assertEqual(
+            acc["credentials"]["base_url"], "https://cli-chat-proxy.grok.com/v1"
+        )
+
+    def test_base_url_empty_defaults_to_cli_chat_proxy(self):
+        cpa = {
+            "access_token": _fake_jwt({"exp": 1893456000}),
+            "refresh_token": "rt",
+        }
+        acc = conv.cpa_xai_to_sub2api_account(cpa)
+        self.assertEqual(
+            acc["credentials"]["base_url"], "https://cli-chat-proxy.grok.com/v1"
+        )
 
     def test_document_has_type_version(self):
         doc = conv.build_sub2api_document([])
@@ -76,35 +109,68 @@ class Sub2APIExportTests(unittest.TestCase):
         self.assertEqual(doc["proxies"], [])
         self.assertEqual(doc["accounts"], [])
 
-    def test_credentials_match_official_fields(self):
+    def test_credentials_match_reference_export_shape(self):
         exp = 1893456000
+        iat = exp - 21600
         cpa = {
             "access_token": _fake_jwt(
                 {
                     "exp": exp,
+                    "iat": iat,
                     "sub": "user-1",
                     "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
-                    "scope": "openid profile email offline_access",
+                    "scope": "openid profile email offline_access grok-cli:access api:access",
                 }
             ),
             "refresh_token": "refresh",
-            "id_token": _fake_jwt({"email": "x@y.z", "sub": "user-1"}),
+            "id_token": _fake_jwt(
+                {
+                    "email": "x@y.z",
+                    "sub": "user-1",
+                    "given_name": "To",
+                    "family_name": "",
+                }
+            ),
             "email": "x@y.z",
             "token_type": "Bearer",
             "headers": {"User-Agent": "should-not-export"},
+            "base_url": "https://cli-chat-proxy.grok.com/v1",
         }
         acc = conv.cpa_xai_to_sub2api_account(cpa)
         creds = acc["credentials"]
-        self.assertIn("access_token", creds)
-        self.assertIn("refresh_token", creds)
-        self.assertIn("id_token", creds)
-        self.assertIn("expires_at", creds)
-        self.assertIn("client_id", creds)
-        self.assertIn("email", creds)
-        self.assertIn("base_url", creds)
-        self.assertNotIn("headers", creds)
-        self.assertNotIn("expired", creds)
-        self.assertEqual(acc["extra"]["auth_provider"], "grok")
+        # Reference credential keys (plus we may omit empty)
+        for key in (
+            "_token_version",
+            "access_token",
+            "base_url",
+            "client_id",
+            "email",
+            "expires_at",
+            "id_token",
+            "refresh_token",
+            "scope",
+            "token_type",
+        ):
+            self.assertIn(key, creds, key)
+        # Must NOT leak CPA / non-reference fields
+        for key in (
+            "headers",
+            "expired",
+            "token_endpoint",
+            "redirect_uri",
+            "sub",
+            "expires_in",
+        ):
+            self.assertNotIn(key, creds, key)
+        self.assertEqual(creds["base_url"], "https://cli-chat-proxy.grok.com/v1")
+        self.assertEqual(creds["_token_version"], iat * 1000)
+        self.assertEqual(acc["name"], "To")
+        self.assertEqual(acc["priority"], 1)
+        self.assertEqual(acc["concurrency"], 1)
+        self.assertEqual(acc["rate_multiplier"], 1)
+        self.assertTrue(acc["auto_pause_on_expired"])
+        self.assertEqual(acc["extra"], {"email": "x@y.z"})
+        self.assertNotIn("import_source", acc["extra"])
 
 
 if __name__ == "__main__":

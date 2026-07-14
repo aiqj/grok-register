@@ -64,6 +64,7 @@
     "cpa_headless": true,
     "cpa_force_standalone": true,
     "cpa_mint_prefer_warm_browser": true,
+    "cpa_mint_prefer_sso_build": true,
     "cpa_mint_timeout_sec": 300,
     "cpa_mint_required": false,
     "cpa_probe_after_write": true,
@@ -74,6 +75,7 @@
     "sub2api_export_enabled": true,
     "sub2api_export_dir": "./exports/sub2api",
     "sub2api_combined_file": "./exports/sub2api/sub2api-accounts.json",
+    "sub2api_base_url_mode": "preserve",
     "cpa_cloud_upload_enabled": false,
     "cpa_cloud_api_base": "",
     "cpa_cloud_management_key": "",
@@ -86,5 +88,9 @@
     "sub2api_cloud_skip_default_group_bind": false,
     "sub2api_cloud_timeout": 60,
     "sub2api_cloud_retries": 3,
+    "sub2api_upload_check_tokens": true,
+    "sub2api_upload_skip_unhealthy": true,
+    "sub2api_token_skew_sec": 120,
+    "sub2api_token_soon_sec": 3600,
     "data_dir": "."
 }

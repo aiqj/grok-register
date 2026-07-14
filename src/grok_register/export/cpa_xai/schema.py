@@ -16,12 +16,18 @@ DEFAULT_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 # Free Build promo path (NOT api.x.ai)
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 
+# Align with CLIProxyAPI v7 applyXAIChatHeaders (internal/runtime/executor/xai_executor.go)
+# for OAuth + cli-chat-proxy (using_api=false). Bare requests without these get HTTP 426.
 DEFAULT_CLIENT_HEADERS: dict[str, str] = {
+    "X-XAI-Token-Auth": "xai-grok-cli",
     "x-grok-client-version": "0.2.93",
-    "x-xai-token-auth": "xai-grok-cli",
-    "x-authenticateresponse": "authenticate-response",
-    "x-grok-client-identifier": "grok-shell",
-    "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
+    "User-Agent": "xai-grok-workspace/0.2.93",
+}
+# Sub2API upstream headers (openai_gateway_grok.go applyGrokCLIHeaders)
+# Note: Sub2API does NOT send X-XAI-Token-Auth — only UA + client version.
+SUB2API_UPSTREAM_HEADERS: dict[str, str] = {
+    "User-Agent": "sub2api-grok/1.0",
+    "X-Grok-Client-Version": "0.2.93",
 }
 
 
