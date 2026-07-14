@@ -186,6 +186,8 @@ DEFAULT_CONFIG = {
     "cpa_cloud_management_key": "",
     "cpa_cloud_upload_timeout": 30,
     "cpa_cloud_upload_retries": 3,
+    # Parallel workers for batch 「上传全部 CPA」 (connection reuse per worker)
+    "cpa_cloud_upload_workers": 8,
     # Online Sub2API (Wei-Shaw/sub2api ≥0.1.153): POST /api/v1/admin/accounts/data
     "sub2api_cloud_upload_enabled": False,
     "sub2api_cloud_api_base": "",
@@ -3704,7 +3706,18 @@ try {
         return False
 
 
-def getTurnstileToken(log_callback=None, cancel_callback=None, *, max_rounds: int | None = None):
+def getTurnstileToken(
+    log_callback=None,
+    cancel_callback=None,
+    *,
+    max_rounds: int | None = None,
+    assist: bool = False,
+):
+    """Poll / click Turnstile until a response token appears.
+
+    assist=True: caller already waited passively — shorter passive window and
+    earlier clicks (used after profile form is filled and CF is stuck).
+    """
     if get_page() is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
@@ -3741,18 +3754,30 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, *, max_rounds: in
         except Exception:
             pass
 
+    fast = bool(PERF_FLAGS.get("fast"))
     if max_rounds is not None:
         rounds = max_rounds
+    elif assist:
+        # Already waited outside — do not burn another 30–40s passive
+        rounds = 32 if bg_mode else (28 if not fast else 22)
     elif bg_mode:
         rounds = 70 if hmode == "offscreen" else 50
-    elif PERF_FLAGS.get("fast"):
+    elif fast:
         rounds = 40
     else:
-        rounds = 45  # ~40s passive wait for managed Turnstile
-    poll = 0.5 if bg_mode else 0.9
+        rounds = 45  # full challenge from cold start
+    if assist:
+        poll = 0.45 if bg_mode else 0.55
+        # Assist: short passive then click (caller already waited ~few seconds)
+        passive_rounds = 0 if bg_mode else (2 if fast else 3)
+        click_every = 2 if bg_mode else 3
+    else:
+        poll = 0.5 if bg_mode else 0.75
+        # Headed cold start: let managed widget try alone first
+        passive_rounds = 0 if bg_mode else (12 if not fast else 7)
+        click_every = 2 if bg_mode else 5
     last_strategy = ""
-    # Headed: passive first (let managed Turnstile self-solve). Click only later.
-    passive_rounds = 0 if bg_mode else (18 if not PERF_FLAGS.get("fast") else 10)
+    last_progress_log = 0.0
     for i in range(0, rounds):
         raise_if_cancelled(cancel_callback)
         try:
@@ -3772,11 +3797,11 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, *, max_rounds: in
                 sleep_with_cancel(1.2, cancel_callback, scale=False)
                 continue
 
-            # Background: click periodically. Headed: wait passively, rare gentle click.
+            # Background: click periodically. Headed: wait passively, then gentle clicks.
             should_click = False
             if bg_mode:
-                should_click = i < 8 or i % 2 == 0
-            elif i >= passive_rounds and (i - passive_rounds) % 6 == 0:
+                should_click = i < 8 or i % click_every == 0
+            elif i >= passive_rounds and (i - passive_rounds) % click_every == 0:
                 should_click = True
             if should_click:
                 strategy = _click_turnstile_widget(get_page(), log_callback=log_callback)
@@ -3784,6 +3809,12 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, *, max_rounds: in
                     if log_callback:
                         log_callback(f"[Debug] Turnstile 点击策略: {strategy}")
                     last_strategy = strategy
+            elif log_callback and assist and i > 0 and i % 8 == 0:
+                # Quiet progress during assist (avoid every-poll spam)
+                now_ts = time.time()
+                if now_ts - last_progress_log >= 2.5:
+                    log_callback(f"[*] Turnstile 协助中… 已尝试 {i}/{rounds}")
+                    last_progress_log = now_ts
         except Exception as exc:
             if log_callback and i == 0:
                 log_callback(f"[Debug] Turnstile 轮询异常: {exc}")
@@ -3801,6 +3832,236 @@ def getTurnstileToken(log_callback=None, cancel_callback=None, *, max_rounds: in
         + "。有界面：勿强行伪装 UA；可手动点 widget 刷新；或配置 PROXY_POOL。"
         f" last_click={last_strategy or 'none'}"
     )
+
+
+def _fill_turnstile_response_token(token: str, page=None) -> int:
+    """Write token into cf-turnstile-response; return filled length (0 if fail)."""
+    pg = page or get_page()
+    if pg is None or not token:
+        return 0
+    try:
+        synced = pg.run_js(
+            """
+const token = String(arguments[0] || '').trim();
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return 0;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token);
+else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+return String(cfInput.value || '').trim().length;
+            """,
+            token,
+        )
+        return int(synced or 0)
+    except Exception:
+        return 0
+
+
+def _detect_page_cf_state(page=None) -> str:
+    """Return page CF/Turnstile status for post-signup and redirect pages.
+
+    Values:
+      ok | wait-cf:<len> | cf-interstitial | cf-failed
+    """
+    pg = page or get_page()
+    if pg is None:
+        return "ok"
+    try:
+        state = pg.run_js(
+            r"""
+try {
+  const url = String(location.href || '');
+  const title = String(document.title || '');
+  const bodyText = String((document.body && document.body.innerText) || '');
+  const blob = (title + ' ' + bodyText).toLowerCase();
+  if (/验证失败|故障排除|verification failed|trouble\s*shoot/i.test(bodyText + title)) {
+    return 'cf-failed';
+  }
+  // EN + CN managed challenge (redirect=grok-com often shows Chinese copy)
+  if (/attention required|just a moment|checking your browser|cf-browser-verification|sorry, you have been blocked|enable javascript and cookies/i.test(blob)
+      || /cdn-cgi\/challenge/i.test(url)
+      || /请稍候|正在进行安全验证|安全验证|请验证您是真人|验证您是真人|不是自动程序/i.test(bodyText + title)
+      || (/grok\.com/i.test(url) && /cloudflare|安全验证|请稍候/i.test(blob))) {
+    return 'cf-interstitial';
+  }
+  const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+  const hasWidget = !!cfInput
+    || !!document.querySelector('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"], div.cf-turnstile, [data-sitekey]');
+  if (hasWidget) {
+    const tok = String((cfInput && cfInput.value) || '').trim();
+    if (tok.length < 80) return 'wait-cf:' + tok.length;
+  }
+  // Redirect target often shows managed challenge without classic input yet
+  if (/grok\.com|accounts\.x\.ai/i.test(url)
+      && !!document.querySelector('iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"]')) {
+    return 'wait-cf:0';
+  }
+  return 'ok';
+} catch (e) {
+  return 'ok';
+}
+"""
+        )
+        return str(state or "ok")
+    except Exception:
+        return "ok"
+
+
+def _dismiss_cookie_consent(page=None, log_callback=None) -> bool:
+    """Click cookie-banner accept if present (blocks nothing but slows SSO redirect)."""
+    pg = page or get_page()
+    if pg is None:
+        return False
+    try:
+        hit = pg.run_js(
+            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const buttons = Array.from(document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"]'))
+  .filter(isVisible);
+const prefer = buttons.find((b) => {
+  const t = ((b.innerText || b.textContent || b.value || b.getAttribute('aria-label') || '') + '').replace(/\s+/g, '');
+  return /接受所有Cookie|接受全部Cookie|同意全部|全部接受|Accept all|Allow all|Accept All Cookies/i.test(t);
+});
+const fallback = buttons.find((b) => {
+  const t = ((b.innerText || b.textContent || b.value || '') + '').replace(/\s+/g, '');
+  return /接受|同意|Allow|Accept/i.test(t) && !/拒绝|Reject|Decline|关闭/i.test(t);
+});
+const btn = prefer || fallback;
+if (!btn) return false;
+btn.click();
+return true;
+"""
+        )
+        if hit and log_callback:
+            log_callback("[*] 已点击 Cookie 同意（加速跳转）")
+        return bool(hit)
+    except Exception:
+        return False
+
+
+def _cf_assist_timings() -> tuple[float, float, bool]:
+    """Return (retry_after_sec, retry_gap_sec, bg_mode)."""
+    fast = bool(PERF_FLAGS.get("fast"))
+    try:
+        from grok_register.proxy.pool import resolve_headless as _rh
+
+        bg_mode = bool(_rh(config))
+    except Exception:
+        bg_mode = False
+    # Match profile-form CF assist timings
+    retry_after = (2.0 if fast else 2.5) if bg_mode else (2.5 if fast else 4.0)
+    retry_gap = (4.0 if fast else 5.5) if bg_mode else (6.0 if fast else 9.0)
+    return retry_after, retry_gap, bg_mode
+
+
+def _maybe_assist_page_turnstile(
+    *,
+    log_callback=None,
+    cancel_callback=None,
+    wait_cf_since: float | None,
+    last_cf_retry_at: float,
+    last_cf_wait_log_at: float,
+    phase: str = "Cloudflare",
+    force: bool = False,
+) -> tuple[float | None, float, float, bool]:
+    """Throttle-log + timed assist for any page stuck on Turnstile/CF.
+
+    Returns (wait_cf_since, last_cf_retry_at, last_cf_wait_log_at, solved).
+    """
+    state = _detect_page_cf_state()
+    now = time.time()
+    if state == "ok":
+        return wait_cf_since, last_cf_retry_at, last_cf_wait_log_at, False
+    if state == "cf-failed":
+        if log_callback and (now - last_cf_wait_log_at) >= 2.5:
+            log_callback(
+                f"[!] {phase}：Turnstile 显示验证失败/故障排除，请手动刷新或换网络"
+            )
+            last_cf_wait_log_at = now
+        return wait_cf_since or now, last_cf_retry_at, last_cf_wait_log_at, False
+
+    token_len = "0"
+    if state.startswith("wait-cf:"):
+        token_len = state.split(":", 1)[1] if ":" in state else "0"
+    first_cf_sight = wait_cf_since is None
+    if first_cf_sight:
+        wait_cf_since = now
+        if log_callback:
+            kind0 = "拦截页" if state == "cf-interstitial" else "人机验证"
+            log_callback(f"[*] {phase}：检测到 Cloudflare/{kind0}，等待或协助…")
+        try:
+            _, _, bg_mode = _cf_assist_timings()
+            if bg_mode:
+                _bring_page_front_for_turnstile(get_page(), log_callback=log_callback)
+        except Exception:
+            pass
+
+    if log_callback and (now - last_cf_wait_log_at) >= 2.2:
+        elapsed = int(now - wait_cf_since)
+        kind = "拦截页" if state == "cf-interstitial" else "人机验证"
+        log_callback(
+            f"[*] {phase} 等 {kind}… 已等 {elapsed}s  token长度={token_len}"
+        )
+        last_cf_wait_log_at = now
+
+    retry_after, retry_gap, bg_mode = _cf_assist_timings()
+    # Managed challenge (请验证您是真人): click immediately on first sight — user stares at checkbox
+    if state == "cf-interstitial":
+        retry_after = 0.0 if first_cf_sight or force else min(retry_after, 0.8)
+        retry_gap = min(retry_gap, 3.5)
+    if (
+        force
+        or (first_cf_sight and state == "cf-interstitial")
+        or (
+            now - wait_cf_since >= retry_after
+            and now - last_cf_retry_at >= retry_gap
+        )
+    ):
+        if _turnstile_widget_failed(get_page()) and state != "cf-interstitial":
+            if log_callback:
+                log_callback(f"[!] {phase}：Turnstile 已失败，跳过自动连点")
+            last_cf_retry_at = now
+            return wait_cf_since, last_cf_retry_at, last_cf_wait_log_at, False
+        if log_callback:
+            log_callback(f"[*] {phase}：协助点击 Turnstile…")
+        try:
+            # Managed CF (请验证您是真人) often has no parent cf-turnstile-response —
+            # still run click strategies; token fill is best-effort.
+            strategy = _click_turnstile_widget(get_page(), log_callback=log_callback)
+            if log_callback and strategy:
+                log_callback(f"[Debug] {phase} 点击策略: {strategy}")
+            # Interstitial: do NOT block 10–20s on token poll — SSO may land on x.ai
+            # domain while the checkbox auto-passes; keep sso loop responsive.
+            token_rounds = 6 if state == "cf-interstitial" else (22 if not bg_mode else 30)
+            token = getTurnstileToken(
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                assist=True,
+                max_rounds=token_rounds,
+            )
+            if token:
+                synced = _fill_turnstile_response_token(token)
+                if log_callback:
+                    log_callback(f"[*] {phase} Turnstile 回填完成，长度={synced}")
+                last_cf_retry_at = now
+                # After interstitial, token may clear on navigation — still report progress
+                return wait_cf_since, last_cf_retry_at, last_cf_wait_log_at, synced >= 80
+            # Click-only path: widget may clear challenge without exposing token to parent
+            last_cf_retry_at = now
+            return wait_cf_since, last_cf_retry_at, last_cf_wait_log_at, bool(strategy)
+        except Exception as cf_exc:
+            if log_callback:
+                log_callback(f"[Debug] {phase} Turnstile 协助失败: {cf_exc}")
+        last_cf_retry_at = now
+    return wait_cf_since, last_cf_retry_at, last_cf_wait_log_at, False
 
 
 def build_profile():
@@ -3845,6 +4106,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
+    last_cf_wait_log_at = 0.0
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -3927,9 +4189,7 @@ return 'filled-no-submit';
 
             if isinstance(filled, str) and filled.startswith("wait-cloudflare"):
                 form_filled_once = True
-                if log_callback:
-                    token_len = filled.split(":", 1)[1] if ":" in filled else "0"
-                    log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
+                token_len = filled.split(":", 1)[1] if ":" in filled else "0"
                 fast = bool(PERF_FLAGS.get("fast"))
                 try:
                     from grok_register.proxy.pool import resolve_headless as _rh
@@ -3937,26 +4197,33 @@ return 'filled-no-submit';
                     bg_mode = bool(_rh(config))
                 except Exception:
                     bg_mode = False
-                if token_len == "0":
-                    pause_seconds = 0.4 if fast else random.uniform(0.8, 1.4)
-                    if log_callback and not fast and wait_cf_since is None:
-                        log_callback(
-                            "[*] Cloudflare token 为空，先被动等待 managed 校验"
-                            + ("（后台将稍后协助点击）" if bg_mode else "（有界面请勿关窗，可手动点一下勾选框）")
-                        )
-                    sleep_with_cancel(pause_seconds, cancel_callback, scale=False)
                 now = time.time()
                 if wait_cf_since is None:
                     wait_cf_since = now
+                    if log_callback:
+                        log_callback(
+                            "[*] 资料已填，等待 Cloudflare…"
+                            + ("（后台将协助点击）" if bg_mode else "（有界面可手动点勾选框）")
+                        )
                     # Background only: raise window immediately. Headed: no click spam.
                     if bg_mode:
                         try:
                             _bring_page_front_for_turnstile(get_page(), log_callback=log_callback)
                         except Exception:
                             pass
-                # Headed: wait ~15s before assist. Background: earlier.
-                retry_after = (3.0 if fast else 5.0) if bg_mode else (8.0 if fast else 15.0)
-                retry_gap = (5.0 if fast else 8.0) if bg_mode else (12.0 if fast else 18.0)
+                # Throttle wait logs (was every ~0.5s → noise + feel of long wait)
+                if log_callback and (now - last_cf_wait_log_at) >= 2.2:
+                    elapsed = int(now - wait_cf_since)
+                    log_callback(
+                        f"[*] 等待 Cloudflare… 已等 {elapsed}s  token长度={token_len}"
+                    )
+                    last_cf_wait_log_at = now
+                if token_len == "0":
+                    pause_seconds = 0.35 if fast else 0.55
+                    sleep_with_cancel(pause_seconds, cancel_callback, scale=False)
+                # Headed: first assist ~4s (was 15s). Background: ~2.5s.
+                retry_after = (2.0 if fast else 2.5) if bg_mode else (2.5 if fast else 4.0)
+                retry_gap = (4.0 if fast else 5.5) if bg_mode else (6.0 if fast else 9.0)
                 if now - wait_cf_since >= retry_after and now - last_cf_retry_at >= retry_gap:
                     if _turnstile_widget_failed(get_page()):
                         if log_callback:
@@ -3967,10 +4234,13 @@ return 'filled-no-submit';
                         last_cf_retry_at = now
                     else:
                         if log_callback:
-                            log_callback("[*] Cloudflare 验证协助：主动触发 Turnstile...")
+                            log_callback("[*] Cloudflare 仍无 token，协助点击 Turnstile…")
                         try:
                             token = getTurnstileToken(
-                                log_callback=log_callback, cancel_callback=cancel_callback
+                                log_callback=log_callback,
+                                cancel_callback=cancel_callback,
+                                assist=True,
+                                max_rounds=28 if not bg_mode else 36,
                             )
                             if token:
                                 synced = get_page().run_js(
@@ -3993,7 +4263,7 @@ return String(cfInput.value || '').trim().length;
                             if log_callback:
                                 log_callback(f"[Debug] Turnstile 协助失败: {cf_exc}")
                         last_cf_retry_at = now
-                sleep_with_cancel(0.45 if fast else 0.9, cancel_callback, scale=False)
+                sleep_with_cancel(0.4 if fast else 0.55, cancel_callback, scale=False)
                 continue
 
             if filled in ("ready-to-submit", "filled-no-submit"):
@@ -4052,9 +4322,7 @@ return 'submitted';
         )
 
         if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
-            if log_callback:
-                token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
-                log_callback(f"[*] 等待 Cloudflare 人机验证通过后再提交... 当前token长度={token_len}")
+            token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
             now = time.time()
             try:
                 from grok_register.proxy.pool import resolve_headless as _rh
@@ -4070,8 +4338,14 @@ return 'submitted';
                     except Exception:
                         pass
             fast = bool(PERF_FLAGS.get("fast"))
-            retry_after = (3.0 if fast else 5.0) if bg_mode else (8.0 if fast else 15.0)
-            retry_gap = (5.0 if fast else 8.0) if bg_mode else (12.0 if fast else 18.0)
+            if log_callback and (now - last_cf_wait_log_at) >= 2.2:
+                elapsed = int(now - wait_cf_since) if wait_cf_since else 0
+                log_callback(
+                    f"[*] 提交前等 Cloudflare… 已等 {elapsed}s  token长度={token_len}"
+                )
+                last_cf_wait_log_at = now
+            retry_after = (2.0 if fast else 2.5) if bg_mode else (2.5 if fast else 4.0)
+            retry_gap = (4.0 if fast else 5.5) if bg_mode else (6.0 if fast else 9.0)
             if now - wait_cf_since >= retry_after and now - last_cf_retry_at >= retry_gap:
                 if _turnstile_widget_failed(get_page()):
                     if log_callback:
@@ -4079,10 +4353,13 @@ return 'submitted';
                     last_cf_retry_at = now
                 else:
                     if log_callback:
-                        log_callback("[*] 提交前仍卡住，主动触发 Turnstile...")
+                        log_callback("[*] 提交前仍无 token，协助点击 Turnstile…")
                     try:
                         token = getTurnstileToken(
-                            log_callback=log_callback, cancel_callback=cancel_callback
+                            log_callback=log_callback,
+                            cancel_callback=cancel_callback,
+                            assist=True,
+                            max_rounds=28 if not bg_mode else 36,
                         )
                         if token:
                             synced = get_page().run_js(
@@ -4105,7 +4382,7 @@ return String(cfInput.value || '').trim().length;
                         if log_callback:
                             log_callback(f"[Debug] Turnstile 协助失败: {cf_exc}")
                     last_cf_retry_at = now
-            sleep_with_cancel(0.45 if fast else 0.9, cancel_callback, scale=False)
+            sleep_with_cancel(0.4 if fast else 0.55, cancel_callback, scale=False)
             continue
 
         if submit_state == "submitted":
@@ -4130,13 +4407,19 @@ return String(cfInput.value || '').trim().length;
 
 
 def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
+    """Wait for SSO after signup submit; assist CF/Turnstile on final page and redirect=grok-com."""
     deadline = time.time() + timeout
     last_seen_names = set()
     last_submit_retry = 0.0
+    last_cookie_try_at = 0.0
     last_cf_retry_at = 0.0
+    last_cf_wait_log_at = 0.0
+    wait_cf_since = None
     final_no_submit_state = ""
     final_no_submit_since = None
     final_no_submit_timeout = 25
+    last_url_log = ""
+    fast = bool(PERF_FLAGS.get("fast"))
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -4146,9 +4429,58 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
                 sleep_with_cancel(1, cancel_callback)
                 continue
 
-            # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
             now = time.time()
-            if now - last_submit_retry >= 2.5:
+            # Log navigation toward grok.com (redirect=grok-com) once per URL
+            try:
+                cur_url = str(get_page().url or "")
+            except Exception:
+                cur_url = ""
+            if cur_url and cur_url != last_url_log:
+                last_url_log = cur_url
+                if log_callback:
+                    short = cur_url if len(cur_url) < 120 else cur_url[:117] + "..."
+                    # Always log URL change after submit (debug redirect/CF path)
+                    if any(
+                        k in cur_url
+                        for k in (
+                            "grok.com",
+                            "challenge",
+                            "cdn-cgi",
+                            "accounts.x.ai",
+                        )
+                    ):
+                        log_callback(f"[*] 注册后页面: {short}")
+
+            # Cookie banner ("接受所有 Cookie") on「您正在登录」— try ASAP (own throttle)
+            if now - last_cookie_try_at >= 0.8:
+                last_cookie_try_at = now
+                if _dismiss_cookie_consent(get_page(), log_callback=log_callback):
+                    sleep_with_cancel(0.25, cancel_callback, scale=False)
+
+            # Post-submit / redirect: CF interstitial or Turnstile on accounts or grok.com
+            cf_state = _detect_page_cf_state()
+            if cf_state != "ok":
+                wait_cf_since, last_cf_retry_at, last_cf_wait_log_at, solved = (
+                    _maybe_assist_page_turnstile(
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                        wait_cf_since=wait_cf_since,
+                        last_cf_retry_at=last_cf_retry_at,
+                        last_cf_wait_log_at=last_cf_wait_log_at,
+                        phase="注册后/跳转",
+                        force=(cf_state == "cf-interstitial" and wait_cf_since is None),
+                    )
+                )
+                if solved:
+                    sleep_with_cancel(0.4 if fast else 0.7, cancel_callback, scale=False)
+                else:
+                    sleep_with_cancel(0.4 if fast else 0.55, cancel_callback, scale=False)
+                # Keep polling cookies below even if CF still open
+            else:
+                wait_cf_since = None
+
+            # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
+            if now - last_submit_retry >= (1.8 if fast else 2.5):
                 retried = get_page().run_js(
                     r"""
 function isVisible(node) {
@@ -4157,6 +4489,11 @@ function isVisible(node) {
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
+}
+const bodyT = ((document.body && document.body.innerText) || '') + ' ' + (document.title || '');
+// Intermediate login / cookie dialog — not a hard failure
+if (/您正在登录|正在登录|signing you in|logging you in/i.test(bodyT)) {
+    return 'logging-in';
 }
 const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span')).find((el) => {
     const t = (el.textContent || '').replace(/\\s+/g, '');
@@ -4200,48 +4537,48 @@ return 'final-page-clicked-submit';
                     """
                 )
                 last_submit_retry = now
-                if log_callback and (retried == "final-page-clicked-submit" or (isinstance(retried, str) and retried.startswith("final-page-no-submit"))):
+                if log_callback and retried == "logging-in":
+                    # Quiet: cookie/login intermediate — only log once every few seconds
+                    if (now - last_cf_wait_log_at) >= 3.0:
+                        log_callback("[*] 注册后：页面显示「正在登录…」，等待跳转/同意 Cookie")
+                        last_cf_wait_log_at = now
+                if log_callback and (
+                    retried == "final-page-clicked-submit"
+                    or (
+                        isinstance(retried, str)
+                        and retried.startswith("final-page-no-submit")
+                    )
+                ):
                     log_callback(f"[Debug] 最终页状态: {retried}")
                 if isinstance(retried, str) and retried.startswith("final-page-no-submit"):
-                    if retried != final_no_submit_state:
+                    # Cookie consent only — not a real missing submit button
+                    if "Cookie" in retried or "接受" in retried or "拒绝" in retried:
+                        final_no_submit_state = ""
+                        final_no_submit_since = None
+                    elif retried != final_no_submit_state:
                         final_no_submit_state = retried
                         final_no_submit_since = now
-                    elif final_no_submit_since and now - final_no_submit_since >= final_no_submit_timeout:
+                    elif (
+                        final_no_submit_since
+                        and now - final_no_submit_since >= final_no_submit_timeout
+                    ):
                         raise AccountRetryNeeded(
                             f"最终注册页状态 {final_no_submit_timeout}s 未变化且未找到提交按钮，重试当前账号: {retried}"
                         )
                 else:
                     final_no_submit_state = ""
                     final_no_submit_since = None
-                if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
-                    token_len = retried.split(":", 1)[1] if ":" in retried else "0"
-                    log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}")
-                    if now - last_cf_retry_at >= 10:
-                        if log_callback:
-                            log_callback("[*] 最终页 Cloudflare 卡住，自动二次复用 Turnstile...")
-                        try:
-                            token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                            if token:
-                                synced = get_page().run_js(
-                                    """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                    """,
-                                    token,
-                                )
-                                if log_callback:
-                                    log_callback(f"[*] 最终页 Turnstile 二次复用完成，回填长度={synced}")
-                        except Exception as cf_exc:
-                            if log_callback:
-                                log_callback(f"[Debug] 最终页 Turnstile 二次复用失败: {cf_exc}")
-                        last_cf_retry_at = now
+                if isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
+                    wait_cf_since, last_cf_retry_at, last_cf_wait_log_at, _solved = (
+                        _maybe_assist_page_turnstile(
+                            log_callback=log_callback,
+                            cancel_callback=cancel_callback,
+                            wait_cf_since=wait_cf_since or now,
+                            last_cf_retry_at=last_cf_retry_at,
+                            last_cf_wait_log_at=last_cf_wait_log_at,
+                            phase="最终注册页",
+                        )
+                    )
 
             cookies = get_page().cookies(all_domains=True, all_info=True) or []
             for item in cookies:
@@ -4266,7 +4603,7 @@ return String(cfInput.value || '').trim().length;
         except Exception:
             pass
 
-        sleep_with_cancel(1, cancel_callback)
+        sleep_with_cancel(0.55 if fast else 0.85, cancel_callback, scale=False)
 
     raise Exception(
         f"等待超时：未获取到 sso cookie。已看到 cookies: {sorted(last_seen_names)}"
@@ -4312,7 +4649,9 @@ def _cpa_cloud_cfg_int(cfg, name, default, minimum=None, maximum=None):
     return value
 
 
-def upload_cpa_auth_file_to_cloud(cpa_path, cfg=None, log_callback=None, force=False):
+def upload_cpa_auth_file_to_cloud(
+    cpa_path, cfg=None, log_callback=None, force=False, session=None
+):
     """Upload one local CPA/OIDC JSON auth file to online CLIProxyAPI.
 
     Target: ``POST {api}/v0/management/auth-files`` (multipart field ``file``).
@@ -4325,6 +4664,9 @@ def upload_cpa_auth_file_to_cloud(cpa_path, cfg=None, log_callback=None, force=F
       - cpa_cloud_api_base / CPA_CLOUD_API_BASE  e.g. https://cpa.example.com:8317
       - cpa_cloud_management_key / CPA_CLOUD_MANAGEMENT_KEY
       - cpa_cloud_upload_timeout, cpa_cloud_upload_retries
+      - cpa_cloud_upload_workers (batch only)
+
+    ``session``: optional ``requests.Session`` for connection reuse (batch upload).
     """
     cfg = cfg or config
     log = log_callback or (lambda m: None)
@@ -4357,11 +4699,12 @@ def upload_cpa_auth_file_to_cloud(cpa_path, cfg=None, log_callback=None, force=F
         "Authorization": "Bearer " + key,
         "X-Management-Key": key,
     }
+    http = session if session is not None else std_requests
     for attempt in range(1, retries + 1):
         try:
             with open(path, "rb") as fh:
                 files = {"file": (name, fh, "application/json")}
-                res = std_requests.post(url, headers=headers, files=files, timeout=timeout)
+                res = http.post(url, headers=headers, files=files, timeout=timeout)
             preview = response_preview(res, 300)
             if 200 <= res.status_code < 300:
                 try:
@@ -4407,7 +4750,7 @@ def upload_cpa_auth_file_to_cloud(cpa_path, cfg=None, log_callback=None, force=F
                 }
             if attempt < retries and res.status_code in (408, 429, 500, 502, 503, 504):
                 log(f"[cloud-cpa] upload retry {attempt}/{retries}: {last_error}")
-                time.sleep(min(2 * attempt, 8))
+                time.sleep(min(1.0 * attempt, 4))
                 continue
             log(f"[cloud-cpa] upload failed: {last_error}")
             return {
@@ -4421,7 +4764,7 @@ def upload_cpa_auth_file_to_cloud(cpa_path, cfg=None, log_callback=None, force=F
             last_error = str(exc)
             if attempt < retries:
                 log(f"[cloud-cpa] upload retry {attempt}/{retries}: {exc}")
-                time.sleep(min(2 * attempt, 8))
+                time.sleep(min(1.0 * attempt, 4))
                 continue
             log(f"[cloud-cpa] upload exception: {exc}")
             return {"ok": False, "path": path, "name": name, "error": str(exc)}
@@ -5036,6 +5379,7 @@ def upload_cpa_auth_dir_to_cloud(
     pattern="xai-*.json",
     files=None,
     recursive=False,
+    workers=None,
 ):
     """Batch-upload local CPA auth JSON files to online CLIProxyAPI.
 
@@ -5043,7 +5387,10 @@ def upload_cpa_auth_dir_to_cloud(
       cpa_dir: directory (batch root, ``…/cpa``, or exports parent)
       files: explicit file paths / globs (takes priority)
       recursive: walk subdirs for ``xai-*.json`` (all batches under exports/)
+      workers: parallel upload threads (default ``cpa_cloud_upload_workers``, 8)
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     cfg = cfg or config
     log = log_callback or (lambda m: None)
     if not force and not cfg.get("cpa_cloud_upload_enabled", False):
@@ -5067,22 +5414,119 @@ def upload_cpa_auth_dir_to_cloud(
             "ok_count": 0,
             "fail_count": 0,
             "files": [],
+            "elapsed_sec": 0.0,
+            "workers": 0,
         }
 
-    log(f"[cloud-cpa] batch upload {len(paths)} file(s) recursive={recursive}")
+    if workers is None:
+        workers = _cpa_cloud_cfg_int(
+            cfg, "cpa_cloud_upload_workers", 8, minimum=1, maximum=32
+        )
+    else:
+        try:
+            workers = int(workers)
+        except Exception:
+            workers = 8
+        workers = max(1, min(32, workers))
+    # One file → no pool overhead
+    workers = min(workers, len(paths))
+
+    log(
+        f"[cloud-cpa] batch upload {len(paths)} file(s) "
+        f"recursive={recursive} workers={workers}"
+    )
+
+    log_lock = threading.Lock()
+    progress_lock = threading.Lock()
+    done_count = [0]
+    progress_every = max(1, min(10, len(paths) // 10 or 1))
+
+    def slog(msg):
+        with log_lock:
+            log(msg)
+
+    tls = threading.local()
+
+    def _session_for_thread():
+        sess = getattr(tls, "session", None)
+        if sess is None:
+            sess = std_requests.Session()
+            # Keep-alive pool per worker thread
+            try:
+                adapter = std_requests.adapters.HTTPAdapter(
+                    pool_connections=2,
+                    pool_maxsize=4,
+                    max_retries=0,
+                )
+                sess.mount("https://", adapter)
+                sess.mount("http://", adapter)
+            except Exception:
+                pass
+            tls.session = sess
+        return sess
+
+    def _one(path):
+        res = upload_cpa_auth_file_to_cloud(
+            path,
+            cfg=cfg,
+            log_callback=slog,
+            force=True,
+            session=_session_for_thread(),
+        )
+        with progress_lock:
+            done_count[0] += 1
+            n = done_count[0]
+        if n == 1 or n == len(paths) or n % progress_every == 0:
+            slog(f"[cloud-cpa] progress {n}/{len(paths)}")
+        return res
+
+    t0 = time.time()
     results = []
     ok_count = 0
     fail_count = 0
-    for path in paths:
-        res = upload_cpa_auth_file_to_cloud(path, cfg=cfg, log_callback=log, force=True)
-        results.append(res)
+    try:
+        if workers <= 1:
+            for path in paths:
+                results.append(_one(path))
+        else:
+            # Preserve path order in results for stable summaries
+            ordered = [None] * len(paths)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                fut_map = {pool.submit(_one, p): i for i, p in enumerate(paths)}
+                for fut in as_completed(fut_map):
+                    i = fut_map[fut]
+                    try:
+                        ordered[i] = fut.result()
+                    except Exception as exc:
+                        ordered[i] = {
+                            "ok": False,
+                            "path": paths[i],
+                            "name": os.path.basename(paths[i]),
+                            "error": str(exc),
+                        }
+            results = ordered
+    finally:
+        # Best-effort close thread-local sessions is hard after pool exit;
+        # sessions are GC'd with threads. No global session to close.
+        pass
+
+    for res in results:
+        if not res:
+            fail_count += 1
+            continue
         if res.get("ok"):
             ok_count += 1
         elif res.get("skipped"):
             pass
         else:
             fail_count += 1
-    log(f"[cloud-cpa] batch done: ok={ok_count} fail={fail_count} total={len(paths)}")
+
+    elapsed = time.time() - t0
+    rate = (ok_count / elapsed) if elapsed > 0.01 else 0.0
+    log(
+        f"[cloud-cpa] batch done: ok={ok_count} fail={fail_count} total={len(paths)} "
+        f"elapsed={elapsed:.1f}s workers={workers} rate={rate:.1f}/s"
+    )
     return {
         "ok": fail_count == 0 and ok_count > 0,
         "dir": cpa_dir,
@@ -5091,6 +5535,8 @@ def upload_cpa_auth_dir_to_cloud(
         "fail_count": fail_count,
         "paths": paths,
         "files": results,
+        "elapsed_sec": round(elapsed, 2),
+        "workers": workers,
     }
 
 

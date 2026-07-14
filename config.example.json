@@ -81,6 +81,7 @@
     "cpa_cloud_management_key": "",
     "cpa_cloud_upload_timeout": 30,
     "cpa_cloud_upload_retries": 3,
+    "cpa_cloud_upload_workers": 8,
     "sub2api_cloud_upload_enabled": false,
     "sub2api_cloud_api_base": "",
     "sub2api_cloud_admin_key": "",

@@ -179,8 +179,11 @@ def test_batch_upload_force(tmp_path: Path):
         "cpa_cloud_api_base": "http://host:8317",
         "cpa_cloud_management_key": "k",
         "cpa_cloud_upload_retries": 1,
+        "cpa_cloud_upload_workers": 4,
     }
-    with patch("grok_register.core.std_requests.post", return_value=mock_res):
+    mock_sess = MagicMock()
+    mock_sess.post.return_value = mock_res
+    with patch("grok_register.core.std_requests.Session", return_value=mock_sess):
         summary = upload_cpa_auth_dir_to_cloud(
             cpa_dir=str(tmp_path), cfg=cfg, force=True
         )
@@ -188,3 +191,28 @@ def test_batch_upload_force(tmp_path: Path):
     assert summary["ok_count"] == 2
     assert summary["fail_count"] == 0
     assert summary["ok"] is True
+    assert summary.get("workers") == 2  # capped by file count
+    assert mock_sess.post.call_count == 2
+
+
+def test_batch_upload_workers_one_uses_session(tmp_path: Path):
+    (tmp_path / "xai-only@x.com.json").write_text('{"type":"xai"}', encoding="utf-8")
+    mock_res = MagicMock()
+    mock_res.status_code = 200
+    mock_res.json.return_value = {"status": "ok"}
+    mock_res.text = '{"status":"ok"}'
+    mock_sess = MagicMock()
+    mock_sess.post.return_value = mock_res
+    cfg = {
+        "cpa_cloud_api_base": "http://host:8317",
+        "cpa_cloud_management_key": "k",
+        "cpa_cloud_upload_retries": 1,
+        "cpa_cloud_upload_workers": 1,
+    }
+    with patch("grok_register.core.std_requests.Session", return_value=mock_sess):
+        summary = upload_cpa_auth_dir_to_cloud(
+            cpa_dir=str(tmp_path), cfg=cfg, force=True, workers=1
+        )
+    assert summary["ok_count"] == 1
+    assert summary["workers"] == 1
+    assert mock_sess.post.call_count == 1

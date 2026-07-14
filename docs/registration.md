@@ -7,7 +7,9 @@ register_cli / python -m grok_register
     → grok_register.RegistrationEngine
         → BrowserTransport
             → grok_register.core（open / fill / wait SSO）
-    → 成功后可选 CPA mint（cpa_xai，独立步骤）
+    → 成功后可选 CPA mint（cpa_xai）
+         ├─ 默认优先：SSO→Build（HTTP 自动 device 批准）
+         └─ 失败/关闭时：浏览器设备码（CPA 经典）
 ```
 
 | 路径 / 包 | 职责 |
@@ -15,8 +17,34 @@ register_cli / python -m grok_register
 | `grok_register/` | 注册引擎、浏览器 transport、成功副作用配置 |
 | `grok_register/core.py` | 页面操作、临时邮箱、浏览器生命周期（无 GUI） |
 | `register_cli.py` | 批量 CLI、线程、CPA mint 队列、`--remint-missing` |
-| `cpa_xai/` | OIDC 设备码 mint 与 CPA 文件写出 |
+| `cpa_xai/` | OIDC mint：`sso_to_build` + 浏览器设备码 + CPA 写出 |
 | `cpa_export.py` / `cpa_to_sub2api.py` | mint 编排与 Sub2API 转换 |
+
+### 注册后 CPA mint 两条路径
+
+仍属 **Grok Build / device-code OAuth**，不是取消设备码。
+
+| 优先级 | 名称 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| 1 | **SSO→Build** | `cpa_mint_prefer_sso_build=true` | 用注册得到的 `sso` cookie，HTTP 自动 device/code→approve→token（对齐 Sub2API ConvertSSOToBuild）。通常**无**浏览器设备码页。 |
+| 2 | **浏览器设备码** | 回退 | SSO 缺失/失败，或配置关闭优先时；打开 Chromium 确认 user_code。 |
+
+强制只用浏览器设备码：
+
+```json
+"cpa_mint_prefer_sso_build": false
+```
+
+日志：
+
+```text
+[cpa] mint try SSO→Build ...
+[cpa] mint SSO→Build ok scope=...
+# 或
+[cpa] mint SSO→Build failed, fallback browser device: ...
+```
+
+细节见 [export-cpa-and-sub2api.md §3.1](export-cpa-and-sub2api.md)；403 排查见 [grok-403-investigation.md](grok-403-investigation.md)。
 
 ## 后台 / 无交互浏览器
 

@@ -98,18 +98,106 @@ def log(worker_id: int | str, msg: str) -> None:
 # ── 统计 ──
 
 _stats_lock = threading.Lock()
-_stats = {
+_STATS_ZERO = {
     "reg_success": 0,
     "reg_fail": 0,
     "mint_success": 0,
     "mint_fail": 0,
     "mint_skip": 0,
+    "sub2api_success": 0,
+    "sub2api_fail": 0,
+    "sub2api_skip": 0,
+    "sso_build_ok": 0,
+    "browser_device_ok": 0,
 }
+_stats = dict(_STATS_ZERO)
 
 
 def _inc(key: str, n: int = 1) -> None:
     with _stats_lock:
         _stats[key] = _stats.get(key, 0) + n
+
+
+def _reset_stats() -> None:
+    with _stats_lock:
+        _stats.clear()
+        _stats.update(_STATS_ZERO)
+
+
+def _print_run_summary(cfg: dict | None = None) -> dict:
+    """Print a clean multi-line end-of-run summary; return a stats snapshot."""
+    with _stats_lock:
+        s = dict(_stats)
+    cfg = cfg or {}
+    batch = str(cfg.get("export_batch_dir") or "").strip()
+    cpa_on = bool(cfg.get("cpa_export_enabled", True))
+    s2_on = bool(cfg.get("sub2api_export_enabled", True))
+
+    def _disp_w(text: str) -> int:
+        return sum(2 if ord(ch) > 0x2E80 else 1 for ch in text)
+
+    def _pad(text: str, width: int) -> str:
+        return text + " " * max(0, width - _disp_w(text))
+
+    def _row(label: str, ok: int, fail: int, skip: int | None = None) -> str:
+        parts = [
+            f"  {_pad(label, 8)}",
+            f"成功 {ok}",
+            f"失败 {fail}",
+        ]
+        if skip is not None:
+            parts.append(f"跳过 {skip}")
+        # column gaps
+        return f"{parts[0]}  {parts[1]:<10}  {parts[2]:<10}" + (
+            f"  {parts[3]}" if skip is not None else ""
+        )
+
+    lines = [
+        "",
+        "─" * 48,
+        "  本批完成",
+        "─" * 48,
+        _row("注册", s.get("reg_success", 0), s.get("reg_fail", 0)),
+    ]
+    if cpa_on:
+        lines.append(
+            _row(
+                "CPA",
+                s.get("mint_success", 0),
+                s.get("mint_fail", 0),
+                s.get("mint_skip", 0),
+            )
+        )
+    else:
+        lines.append(f"  {_pad('CPA', 8)}  （未启用）")
+    if s2_on:
+        lines.append(
+            _row(
+                "Sub2API",
+                s.get("sub2api_success", 0),
+                s.get("sub2api_fail", 0),
+                s.get("sub2api_skip", 0),
+            )
+        )
+    else:
+        lines.append(f"  {_pad('Sub2API', 8)}  （未启用）")
+
+    # Mint path breakdown when any CPA success used a known path
+    sso_n = int(s.get("sso_build_ok", 0) or 0)
+    br_n = int(s.get("browser_device_ok", 0) or 0)
+    if sso_n or br_n:
+        lines.append("─" * 48)
+        lines.append(
+            f"  {_pad('mint路径', 8)}  SSO→Build {sso_n}    浏览器设备码 {br_n}"
+        )
+
+    if batch:
+        lines.append("─" * 48)
+        lines.append(f"  {_pad('批次目录', 8)}  {batch}")
+    lines.append("─" * 48)
+    lines.append("")
+    print("\n".join(lines), flush=True)
+    return s
 
 
 # forever 任务索引
@@ -476,6 +564,7 @@ def _run_mint_job(
         return {"ok": False, "error": "missing email/password", "email": email}
     if not config.get("cpa_export_enabled", True):
         _inc("mint_skip")
+        _inc("sub2api_skip")
         log(worker_id, f"[cpa] export disabled, skip {email}")
         return {"ok": False, "skipped": True, "email": email}
     try:
@@ -498,10 +587,31 @@ def _run_mint_job(
                     worker_id,
                     f"+ Sub2API: {sub.get('path')} (combined={sub.get('combined_path')})",
                 )
-            elif result.get("sub2api_error"):
-                log(worker_id, f"! Sub2API 导出失败: {result.get('sub2api_error')}")
-            elif config.get("sub2api_export_enabled", True):
-                log(worker_id, f"[sub2api] status={sub or 'missing'}")
+                _inc("sub2api_success")
+            elif not config.get("sub2api_export_enabled", True):
+                _inc("sub2api_skip")
+            elif result.get("sub2api_error") or (sub and not sub.get("ok") and not sub.get("skipped")):
+                log(
+                    worker_id,
+                    f"! Sub2API 导出失败: {result.get('sub2api_error') or sub.get('error') or sub}",
+                )
+                _inc("sub2api_fail")
+            elif sub.get("skipped"):
+                _inc("sub2api_skip")
+                log(worker_id, f"[sub2api] skipped: {sub.get('reason') or 'disabled'}")
+            else:
+                # CPA ok but no sub2api payload (unexpected when export enabled)
+                if config.get("sub2api_export_enabled", True):
+                    log(worker_id, f"[sub2api] status={sub or 'missing'}")
+                    _inc("sub2api_fail")
+                else:
+                    _inc("sub2api_skip")
+            # mint path (SSO→Build vs browser device)
+            src = str(result.get("mint_source") or "").strip().lower()
+            if src.startswith("sso"):
+                _inc("sso_build_ok")
+            elif "browser" in src or src == "browser_device":
+                _inc("browser_device_ok")
             cloud = result.get("cloud_cpa_upload") or {}
             if cloud.get("ok"):
                 log(worker_id, f"+ 线上 CPA: {cloud.get('name')}")
@@ -526,13 +636,16 @@ def _run_mint_job(
             _inc("mint_success")
         elif result.get("skipped"):
             _inc("mint_skip")
+            _inc("sub2api_skip")
             log(worker_id, f"[cpa] skipped: {result.get('reason')}")
         else:
             _inc("mint_fail")
+            _inc("sub2api_skip")
             log(worker_id, f"! CPA auth 未成功: {result.get('error') or result}")
         return result
     except Exception as exc:
         _inc("mint_fail")
+        _inc("sub2api_skip")
         log(worker_id, f"! CPA export 异常: {exc}")
         traceback.print_exc()
         return {"ok": False, "error": str(exc), "email": email}
@@ -1126,6 +1239,12 @@ def main() -> int:
         help="只上传最新一批注册目录（exports/YYYYMMDD_HHMMSS/cpa）；可单独使用，隐含 --upload-cpa-cloud",
     )
     parser.add_argument(
+        "--cpa-upload-workers",
+        type=int,
+        default=0,
+        help="批量上传 CPA 并行线程数（0=用 config cpa_cloud_upload_workers，默认 8）",
+    )
+    parser.add_argument(
         "--upload-sub2api-cloud",
         action="store_true",
         help="将本地 Sub2API JSON 上传到线上 Sub2API（POST /api/v1/admin/accounts/data）",
@@ -1659,12 +1778,18 @@ def main() -> int:
                 or "./exports"
             )
 
+        workers = int(getattr(args, "cpa_upload_workers", 0) or 0)
+        if workers > 0:
+            cfg = dict(cfg)
+            cfg["cpa_cloud_upload_workers"] = workers
+        workers_show = workers or int(cfg.get("cpa_cloud_upload_workers") or 8)
         print(
             f"[*] 上传本地 CPA → 线上 CLIProxyAPI "
             f"api={cfg.get('cpa_cloud_api_base') or os.environ.get('CPA_CLOUD_API_BASE') or '(未配置)'} "
             f"dir={upload_dir or ('(files only)' if upload_files else (cfg.get('cpa_auth_dir') or './exports'))} "
             f"files={len(upload_files) if upload_files else 0} "
-            f"recursive={recursive} latest={bool(args.cpa_upload_latest)}",
+            f"recursive={recursive} latest={bool(args.cpa_upload_latest)} "
+            f"workers={workers_show}",
             flush=True,
         )
         summary = reg.upload_cpa_auth_dir_to_cloud(
@@ -1674,11 +1799,18 @@ def main() -> int:
             force=True,
             files=upload_files,
             recursive=recursive,
+            workers=workers if workers > 0 else None,
         )
         ok_n = int(summary.get("ok_count") or 0)
         fail_n = int(summary.get("fail_count") or 0)
+        elapsed = summary.get("elapsed_sec")
+        elapsed_s = f" elapsed={elapsed}s" if elapsed is not None else ""
+        w_used = summary.get("workers")
+        w_s = f" workers={w_used}" if w_used is not None else ""
         print(
             f"=== 线上 CPA 上传完成: ok={ok_n} fail={fail_n} total={summary.get('total', 0)}"
+            + elapsed_s
+            + w_s
             + (f" batch={latest_batch.name}" if latest_batch is not None else "")
             + " ===",
             flush=True,
@@ -1918,6 +2050,8 @@ def main() -> int:
         browser_recycle_every=max(1, int(args.browser_recycle_every)),
     )
 
+    _reset_stats()
+
     # 断点续跑
     done_count = 0
     if os.path.exists(args.accounts_file):
@@ -2109,14 +2243,8 @@ def main() -> int:
     _log_queue.put(None)
     log_thread.join(timeout=2)
 
-    with _stats_lock:
-        s = dict(_stats)
-    print(
-        f"=== 完成: 注册成功 {s.get('reg_success', 0)}, 注册失败 {s.get('reg_fail', 0)}, "
-        f"CPA成功 {s.get('mint_success', 0)}, CPA失败 {s.get('mint_fail', 0)}, "
-        f"CPA跳过 {s.get('mint_skip', 0)} ===",
-        flush=True,
-    )
+    cfg_end = getattr(reg, "config", {}) or {}
+    s = _print_run_summary(cfg_end)
     return 0 if s.get("reg_success", 0) > 0 else 1
 
 

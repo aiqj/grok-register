@@ -123,6 +123,7 @@ python register_cli.py --sub2api-replace-latest --yes
 | `email_provider` | 邮箱通道 |
 | `export_batch_enabled` | 是否按批分子目录（默认 true） |
 | `cpa_export_enabled` | 是否 mint CPA |
+| `cpa_mint_prefer_sso_build` | 注册后 mint 是否**优先** SSO→Build（默认 true；失败回退浏览器设备码；`false` 则只走浏览器设备码） |
 | `sub2api_export_enabled` | 是否写 Sub2API |
 | `sub2api_base_url_mode` | Sub2API `credentials.base_url`：`preserve`（默认，保留 CPA 的 cli-chat-proxy）/ `cli_chat_proxy` / `api_xai`（旧行为） |
 | `sub2api_upload_check_tokens` | 上传前检查 JWT `exp` / refresh（默认 true） |
@@ -197,6 +198,7 @@ accounts/
 ## 说明
 
 - 注册成功 ≠ Grok Build 对话一定可用；上游对 OAuth 可能返回 `permission-denied`（403），与是否导入 CPA/Sub2API 无关。
+- **CPA mint 仍是设备码体系**：默认优先 **SSO→Build**（HTTP 自动批准，通常无浏览器设备码页）；失败或 `cpa_mint_prefer_sso_build=false` 时回退 **浏览器设备码**。见 [export-cpa-and-sub2api.md §3.1](docs/export-cpa-and-sub2api.md)。
 - 线上 CPA 删除只影响远端凭证，不删本地 `exports/`。
 
 ## 已知问题（Sub2API / 上游，未解决）

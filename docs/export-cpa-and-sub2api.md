@@ -100,31 +100,56 @@ cpa_export.export_cpa_xai_for_account
 
 ## 3. 格式 A：CPA（CLIProxyAPI xAI auth）
 
-### 3.1 如何拿到 token
+### 3.1 如何拿到 token（两条 mint 路径）
 
-实现：`cpa_xai/oauth_device.py` + `browser_confirm.py` + `mint.py`
+实现：`cpa_xai/mint.py` 编排；`sso_to_build.py` / `oauth_device.py` + `browser_confirm.py`。
 
-#### Host 分工
+**仍是 Grok Build / OAuth device-code 体系**，只是默认优先用「有 SSO 时自动批准」，不再总是弹出浏览器设备码页。
+
+#### 路径选择（`mint_and_export`）
+
+| 优先级 | 路径 | 配置 | 何时用 | 日志 |
+| --- | --- | --- | --- | --- |
+| **默认优先** | **A. SSO→Build** | `cpa_mint_prefer_sso_build=true`（默认） | 注册成功后有 `sso` / `sso-rw` cookie | `[cpa] mint try SSO→Build` → `mint SSO→Build ok` |
+| **回退** | **B. 浏览器设备码** | SSO 缺失/失败，或 `cpa_mint_prefer_sso_build=false` | 与旧版 CPA 观感一致 | `mint SSO→Build failed, fallback browser device` 或 `mint_source=browser_device` |
+
+结果字段：`mint_source` = `sso_to_build` | `browser_device`（或 `browser_device_retry`）。
+
+强制只走浏览器设备码（跳过 A）：
+
+```json
+"cpa_mint_prefer_sso_build": false
+```
+
+#### 路径 A：SSO→Build（对齐 Sub2API `ConvertSSOToBuild`）
+
+实现：`cpa_xai/sso_to_build.py`。全程 **HTTP + SSO cookie**，无交互浏览器：
+
+1. 校验 `accounts.x.ai`（带 sso cookie）  
+2. `POST auth.x.ai/oauth2/device/code`（scope 含 `conversations:read/write`，见 `SSO_BUILD_SCOPE`）  
+3. 打开 verification 页 → `device/verify` → `device/approve`（自动 allow）  
+4. `POST …/token` 轮询拿到 access/refresh  
+
+观感：注册后往往**看不到**「填 user_code / 点允许」的设备码浏览器页，但底层仍是 **device-code grant**。
+
+#### 路径 B：浏览器设备码（CPA 经典）
+
+实现：`oauth_device.py` + `browser_confirm.py`。
+
+#### Host 分工（路径 B；路径 A 无 Chromium 确认）
 
 | Host / URL | 谁用 | 说明 |
 | --- | --- | --- |
-| `POST https://auth.x.ai/oauth2/device/code` | urllib | 申请 device code |
+| `POST https://auth.x.ai/oauth2/device/code` | urllib | 申请 device code（A/B 都会） |
 | `POST https://auth.x.ai/oauth2/token` | urllib | 轮询换 token（见 §3.5 代理行为） |
-| `https://accounts.x.ai/oauth2/device?user_code=…` | Chromium | 点「继续」「允许」完成设备授权 |
-| `https://accounts.x.ai/` | Chromium（可选） | cookie 注入时建立上下文 |
+| `https://accounts.x.ai/oauth2/device?user_code=…` | Chromium（**仅 B**） | 点「继续」「允许」 |
+| `https://accounts.x.ai/` | Chromium / HTTP | cookie 注入或 SSO 校验 |
 
-1. **设备码**  
-   - `POST https://auth.x.ai/oauth2/device/code`  
-   - client_id 见 `cpa_xai/schema.py`  
-   - 得到 `device_code`、`user_code`、`verification_uri_complete`（通常为 accounts device 页）  
-2. **浏览器确认**  
-   - 打开 device 页并同意  
-   - 优先：注册刚结束的热 tab（`cpa_mint_prefer_warm_browser`）  
-   - 补 mint：`--remint-missing --headed` + SSO cookie 注入  
-3. **轮询 token**  
-   - `POST https://auth.x.ai/oauth2/token`  
-   - grant_type：`urn:ietf:params:oauth:grant-type:device_code`  
-   - 需同时有 `access_token` 与 `refresh_token`；网络抖动会自动重试  
+路径 B 步骤：
+
+1. **设备码** — `POST …/device/code`（client_id 见 `schema.py`；scope 与 SSO 路径对齐，含 conversations）  
+2. **浏览器确认** — 打开 device 页；优先热 tab（`cpa_mint_prefer_warm_browser`）；补 mint：`--remint-missing --headed` + SSO cookie  
+3. **轮询 token** — grant_type `urn:ietf:params:oauth:grant-type:device_code`  
 
 ### 3.2 组包与落盘
 
@@ -222,6 +247,7 @@ auth-dir: "~/.cli-proxy-api"               # 上传后的 JSON 落盘目录
 | `cpa_cloud_management_key` | 与 CPA `remote-management.secret-key` **明文**一致（或 `MANAGEMENT_PASSWORD`） |
 | `cpa_cloud_upload_timeout` | 单次 HTTP 超时（秒） |
 | `cpa_cloud_upload_retries` | 可重试状态码（408/429/5xx）的次数 |
+| `cpa_cloud_upload_workers` | **批量上传并行线程**（默认 `8`）；菜单「上传全部」/ `--cpa-upload-all` / `--cpa-upload-latest` 生效。CLI 可用 `--cpa-upload-workers N` 覆盖 |
 
 环境变量（优先于 config，适合不把密钥写进文件）：
 
